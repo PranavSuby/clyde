@@ -25,8 +25,37 @@ clyde --yolo               # skip tool approval prompts
 ```
 
 In the REPL: `/profile cloud`, `/model qwen3:8b`, `/models`, `/context`
-(usage report), `/clear`, `/compact` (summarize history to free context),
-`/yolo`, `/help`, `/exit`. Ctrl-C interrupts a response, Ctrl-D quits.
+(usage report), `/resume` (pick an earlier session), `/undo` (revert the
+last file change), `/mcp`, `/clear`, `/compact`, `/yolo`, `/help`, `/exit`.
+Ctrl-C interrupts a response, Ctrl-D quits.
+
+## Sessions
+
+Every turn is saved to `~/.local/share/clyde/sessions/`. `clyde -c`
+continues the most recent session in the current directory; `/resume`
+lists recent ones to pick from. A crash never loses a conversation.
+
+## Approvals & permissions
+
+Mutating tools prompt with a real unified diff. Answers: `y` once, `n`
+deny, `a` always allow *that tool* this session, `p` permanently save an
+allow rule (e.g. `bash(git *)`) to the config. Rules live under
+`permissions.allow`. Reads outside the working directory prompt separately,
+and obvious secrets (AWS/GitHub/Slack/API keys, private key blocks) are
+redacted from tool results before they enter the conversation.
+
+## Agentic extras
+
+- `@path/to/file` in a message attaches the file directly (no tool round-trip).
+- The model can spawn a **read-only subagent** (`task` tool) for broad
+  searches, keeping its own context small — valuable at local context sizes.
+- Long commands stream output live; `run_in_background: true` starts
+  servers/builds detached (`bash_output` / `bash_kill` to manage them).
+- `cd` persists between bash calls, and relative paths follow it.
+- **MCP**: add stdio servers under `mcp_servers` in the config; their tools
+  appear as `mcp__server__tool` (approval required).
+- Transient provider errors retry with backoff; context-overflow errors
+  auto-compact and retry once.
 
 ## Context management
 

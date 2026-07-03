@@ -14,6 +14,7 @@ from rich.markup import escape
 from rich.panel import Panel
 
 from . import config as config_mod
+from .streaming import ThinkFilter  # noqa: F401 — re-exported
 from . import tools
 from .providers import BaseProvider, ProviderError
 
@@ -38,50 +39,6 @@ def redact_secrets(text: str) -> str:
     for pattern, replacement in _REDACT_PATTERNS:
         text = pattern.sub(replacement, text)
     return text
-
-
-class ThinkFilter:
-    """Split a token stream into ('text', s) / ('thinking', s) on <think> tags.
-
-    Handles tags split across chunk boundaries by holding back any suffix
-    that could be the start of a tag.
-    """
-
-    OPEN, CLOSE = "<think>", "</think>"
-
-    def __init__(self):
-        self.buf = ""
-        self.in_think = False
-
-    def feed(self, s: str) -> list[tuple[str, str]]:
-        self.buf += s
-        out = []
-        while True:
-            tag = self.CLOSE if self.in_think else self.OPEN
-            kind = "thinking" if self.in_think else "text"
-            idx = self.buf.find(tag)
-            if idx >= 0:
-                if idx > 0:
-                    out.append((kind, self.buf[:idx]))
-                self.buf = self.buf[idx + len(tag):]
-                self.in_think = not self.in_think
-                continue
-            # hold back the longest suffix that could start the tag
-            keep = 0
-            for i in range(1, len(tag)):
-                if self.buf.endswith(tag[:i]):
-                    keep = i
-            emit = self.buf[: len(self.buf) - keep] if keep else self.buf
-            self.buf = self.buf[len(self.buf) - keep:] if keep else ""
-            if emit:
-                out.append((kind, emit))
-            return out
-
-    def flush(self) -> list[tuple[str, str]]:
-        kind = "thinking" if self.in_think else "text"
-        out = [(kind, self.buf)] if self.buf else []
-        self.buf = ""
-        return out
 
 
 SYSTEM_PROMPT = """\
@@ -130,11 +87,14 @@ adding functionality, refactoring, explaining code. Recommended steps:
 and keep the todo list updated as you work (mark items in_progress and \
 completed as you go).
 2. Use grep, glob, list_dir and read_file to understand the codebase and the \
-user's query. ALWAYS read a file before editing it.
+user's query. ALWAYS read a file before editing it. For broad searches whose \
+results you don't need verbatim, use the task tool (a subagent) instead so \
+your context stays small.
 3. Implement the change. Prefer edit_file for existing files; write_file \
 only for new files or full rewrites.
 4. Verify the solution with tests if possible. NEVER assume a specific test \
-framework or test script — check the README or the codebase to find out.
+framework or test script — check the README or the codebase to find out. Use \
+run_in_background for servers or long builds, then check bash_output.
 5. VERY IMPORTANT: when a task is complete, run lint/typecheck commands \
 (e.g. ruff, npm run lint) if you know them for this project; if you cannot \
 find them, ask the user and suggest writing them to CLYDE.md.
