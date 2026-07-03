@@ -39,6 +39,8 @@ DEFAULT_CONFIG = {
     # Tool calls matching these rules run without an approval prompt.
     # Forms: "edit_file" (whole tool) or "bash(git *)" (command prefix).
     "permissions": {"allow": []},
+    # MCP servers (stdio): {"name": {"command": ["npx", "-y", "some-mcp"]}}
+    "mcp_servers": {},
     "auto_start_ollama": True,
     "max_tool_output_chars": 12000,
     "max_iterations": 40,

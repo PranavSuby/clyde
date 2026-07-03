@@ -4,8 +4,10 @@ import datetime
 import json
 import os
 import platform
+import re
 import subprocess
 import time
+import uuid
 
 from rich.console import Console
 from rich.markup import escape
@@ -16,6 +18,26 @@ from . import tools
 from .providers import BaseProvider, ProviderError
 
 CONTEXT_FILES = ("CLYDE.md", "AGENTS.md", "CLAUDE.md")
+
+CHECKPOINT_DIR = os.path.expanduser("~/.local/share/clyde/checkpoints")
+
+_REDACT_PATTERNS = [
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?"
+                r"-----END [A-Z ]*PRIVATE KEY-----"), "[redacted private key]"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[redacted-aws-key]"),
+    (re.compile(r"\b(?:ghp|gho|ghs)_[A-Za-z0-9]{36,}\b"), "[redacted-github-token]"),
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,}\b"), "[redacted-github-token]"),
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{24,}\b"), "[redacted-api-key]"),
+    (re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"), "[redacted-slack-token]"),
+]
+
+
+def redact_secrets(text: str) -> str:
+    """Strip obvious credentials from tool results before they enter the
+    conversation (and potentially leave the machine on a cloud profile)."""
+    for pattern, replacement in _REDACT_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
 
 
 class ThinkFilter:
@@ -237,6 +259,9 @@ class Agent:
         self.last_usage: dict = {}
         self.session_allow: set[str] = set()
         self.had_error = False
+        self.checkpoints: list[tuple[str, str | None]] = []
+        self.mcp_servers: dict = {}  # populated by the CLI from config
+        tools.set_workspace(self.cwd)
         self.messages: list[dict] = [
             {"role": "system", "content": build_system_prompt(self.cwd)}
         ]
@@ -353,8 +378,9 @@ class Agent:
         return name
 
     def _approve(self, name: str, args: dict) -> bool:
-        if self.yolo or name in self.session_allow \
-                or name not in tools.APPROVAL_REQUIRED:
+        needs_approval = name in tools.APPROVAL_REQUIRED \
+            or name.startswith("mcp__")  # MCP tools may have side effects
+        if self.yolo or name in self.session_allow or not needs_approval:
             return True
         for rule in self.cfg.get("permissions", {}).get("allow", []):
             if config_mod.rule_matches(rule, name, args):
@@ -446,7 +472,7 @@ class Agent:
             state: dict = {"last_kind": None, "midline": False}
 
             try:
-                for kind, payload in self.provider.chat(self.messages, tools.TOOL_SCHEMAS):
+                for kind, payload in self.provider.chat(self.messages, self._tool_schemas()):
                     if kind == "text":
                         for fkind, ftext in think.feed(payload):
                             if fkind == "text":
@@ -534,6 +560,112 @@ class Agent:
 
         self.console.print("[red]Stopped: hit max iterations for one turn.[/red]")
 
+    def _tool_schemas(self) -> list[dict]:
+        from . import mcp
+        return tools.TOOL_SCHEMAS + mcp.tool_schemas(self.mcp_servers)
+
+    def _checkpoint(self, name: str, args: dict):
+        """Snapshot the target file so /undo can restore it."""
+        if name not in ("edit_file", "write_file"):
+            return
+        import shutil
+        path = tools._resolve(str(args.get("path", "")))
+        backup = None
+        if os.path.isfile(path):
+            os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+            backup = os.path.join(CHECKPOINT_DIR, uuid.uuid4().hex)
+            try:
+                shutil.copy2(path, backup)
+            except OSError:
+                backup = None
+        self.checkpoints.append((path, backup))
+
+    def undo(self):
+        """Restore the file state before the last edit/write (/undo)."""
+        import shutil
+        if not self.checkpoints:
+            self.console.print("[dim]Nothing to undo.[/dim]")
+            return
+        path, backup = self.checkpoints.pop()
+        try:
+            if backup:
+                shutil.copy2(backup, path)
+                self.console.print(f"[green]Restored {path}[/green]")
+            elif os.path.exists(path):
+                os.remove(path)
+                self.console.print(f"[green]Removed created file {path}[/green]")
+        except OSError as e:
+            self.console.print(f"[red]Undo failed: {e}[/red]")
+            return
+        self.messages.append({
+            "role": "user",
+            "content": f"[system note: the user ran /undo — your last change "
+                       f"to {path} was reverted]",
+        })
+
+    def _mcp_call(self, name: str, args: dict) -> str:
+        from .mcp import MCPError
+        _, server_name, tool_name = name.split("__", 2)
+        server = self.mcp_servers.get(server_name)
+        if server is None:
+            return f"Error: MCP server '{server_name}' is not connected"
+        try:
+            return server.call(tool_name, args)
+        except MCPError as e:
+            return f"Error: {e}"
+
+    def _run_subagent(self, prompt: str) -> str:
+        """A fresh-context, read-only agent; only its final report returns."""
+        sub_schemas = [s for s in tools.TOOL_SCHEMAS
+                       if s["function"]["name"] in tools.SUBAGENT_TOOL_NAMES]
+        messages = [
+            {"role": "system", "content":
+                "You are a read-only research subagent inside a coding "
+                "assistant. Explore with the provided tools, then answer with "
+                "a compact, factual report (file paths, line numbers, "
+                "conclusions). Your final message is delivered verbatim.\n"
+                f"Working directory: {self.cwd}"},
+            {"role": "user", "content": prompt},
+        ]
+        final_text = ""
+        for _ in range(12):
+            text_parts: list[str] = []
+            tool_calls: list[dict] = []
+            think = ThinkFilter()
+            try:
+                for kind, payload in self.provider.chat(messages, sub_schemas):
+                    if kind == "text":
+                        for fkind, ftext in think.feed(payload):
+                            if fkind == "text":
+                                text_parts.append(ftext)
+                    elif kind == "tool_calls":
+                        tool_calls = payload
+                for fkind, ftext in think.flush():
+                    if fkind == "text":
+                        text_parts.append(ftext)
+            except ProviderError as e:
+                return f"Error: subagent provider error: {e}"
+            final_text = "".join(text_parts).strip()
+            if not tool_calls:
+                break
+            messages.append({"role": "assistant", "content": final_text,
+                             "tool_calls": tool_calls})
+            for tc in tool_calls:
+                self.console.print(
+                    f"  [dim]◐ task → {escape(tc['name'])}"
+                    f"({escape(_args_preview(tc['name'], tc['arguments']))})[/dim]",
+                    highlight=False)
+                if tc["name"] in tools.SUBAGENT_TOOL_NAMES:
+                    result = tools.execute(
+                        tc["name"], tc["arguments"],
+                        self.cfg.get("max_tool_output_chars", 12000))
+                else:
+                    result = "Error: subagents may only use read-only tools"
+                messages.append({"role": "tool", "tool_call_id": tc["id"],
+                                 "name": tc["name"],
+                                 "content": redact_secrets(result)})
+        return final_text or "(subagent returned nothing)"
+
     def _run_tool(self, tc: dict):
         name, args = tc["name"], tc["arguments"]
         self.console.print(
@@ -541,19 +673,51 @@ class Agent:
             f"([white]{escape(_args_preview(name, args))}[/white])",
             markup=True, highlight=False,
         )
-        if self._approve(name, args):
-            result = tools.execute(
-                name, args, self.cfg.get("max_tool_output_chars", 12000)
-            )
-        else:
+        streamed = {"n": 0}
+
+        def live_line(line: str):
+            streamed["n"] += 1
+            if streamed["n"] <= 200:
+                self.console.print("  " + line[:200], style="dim",
+                                   markup=False, highlight=False)
+
+        outside = tools.outside_workspace(name, args)
+        approved = self._approve(name, args)
+        if approved and outside and not self.yolo:
+            try:
+                answer = self.console.input(
+                    f"[yellow]Reads outside the workspace "
+                    f"({escape(outside)}) — allow? \\[y/n][/yellow] "
+                ).strip().lower()
+            except EOFError:
+                answer = "n"
+            approved = answer in ("y", "yes")
+
+        if not approved:
             result = "Error: user denied this tool call. Ask before retrying."
             self.console.print("[red]  denied[/red]")
+        elif name == "task":
+            result = self._run_subagent(str(args.get("prompt", "")))
+        elif name.startswith("mcp__"):
+            result = self._mcp_call(name, args)
+        else:
+            self._checkpoint(name, args)
+            result = tools.execute(
+                name, args, self.cfg.get("max_tool_output_chars", 12000),
+                on_line=live_line if name == "bash" else None,
+            )
+        result = redact_secrets(result)
         all_lines = result.splitlines()
-        shown = all_lines if name == "todo_write" else all_lines[:4]
+        if name == "bash" and streamed["n"]:
+            shown = []  # already printed live
+        elif name == "todo_write":
+            shown = all_lines
+        else:
+            shown = all_lines[:4]
         for line in shown:
             self.console.print("  " + line[:200], style="dim",
                                markup=False, highlight=False)
-        if len(all_lines) > len(shown):
+        if shown and len(all_lines) > len(shown):
             self.console.print(
                 f"  ... ({len(all_lines) - len(shown)} more lines)",
                 style="dim",

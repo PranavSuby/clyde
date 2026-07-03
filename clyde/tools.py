@@ -25,8 +25,45 @@ TOOL_SCHEMAS = [
                         "type": "integer",
                         "description": "Timeout in seconds (default 120)",
                     },
+                    "run_in_background": {
+                        "type": "boolean",
+                        "description": "Run detached and return immediately with an "
+                                       "id; check on it later with bash_output. Use "
+                                       "for dev servers and long builds.",
+                    },
                 },
                 "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bash_output",
+            "description": "Get the output (so far) of a background bash process "
+                           "started with run_in_background, and whether it is "
+                           "still running.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "The background process id"},
+                },
+                "required": ["id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bash_kill",
+            "description": "Kill a background bash process started with "
+                           "run_in_background.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "The background process id"},
+                },
+                "required": ["id"],
             },
         },
     },
@@ -97,6 +134,31 @@ TOOL_SCHEMAS = [
                     },
                 },
                 "required": ["path", "old_string", "new_string"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task",
+            "description": (
+                "Launch a read-only research subagent with a FRESH context to "
+                "explore the codebase and report back. Use it for broad searches "
+                "('find where X is handled', 'summarize how Y works') so the "
+                "file dumps don't fill up your own context — you only get its "
+                "final report. It can read_file/list_dir/glob/grep but cannot "
+                "edit or run commands."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "The research task, self-contained (the "
+                                       "subagent can't see this conversation)",
+                    },
+                },
+                "required": ["prompt"],
             },
         },
     },
@@ -187,6 +249,30 @@ TOOL_SCHEMAS = [
 # Tools that mutate state and need user approval (unless --yolo).
 APPROVAL_REQUIRED = {"bash", "write_file", "edit_file"}
 
+# Read-only tools a subagent may use freely.
+SUBAGENT_TOOL_NAMES = {"read_file", "list_dir", "glob", "grep"}
+
+# The workspace boundary: reads outside it need approval (set by the Agent).
+_WORKSPACE = {"root": None}
+
+
+def set_workspace(root: str):
+    _WORKSPACE["root"] = os.path.realpath(root)
+
+
+def outside_workspace(name: str, args: dict) -> str | None:
+    """If this read touches a path outside the workspace, return that path."""
+    root = _WORKSPACE["root"]
+    if root is None or name not in ("read_file", "list_dir", "glob", "grep"):
+        return None
+    raw = args.get("path") or "."
+    target = os.path.realpath(_resolve(str(raw)))
+    home_cfg = os.path.realpath(os.path.expanduser("~/.config/clyde"))
+    if target == root or target.startswith(root + os.sep) \
+            or target.startswith(home_cfg):
+        return None
+    return target
+
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".cache", "dist", "build"}
 
 # Files the model has read this session (realpath -> mtime at read time).
@@ -227,13 +313,13 @@ def _truncate(text: str, max_chars: int) -> str:
     return text[:half] + f"\n... [{omitted} chars truncated] ...\n" + text[-half:]
 
 
-def execute(name: str, args: dict, max_chars: int = 12000) -> str:
+def execute(name: str, args: dict, max_chars: int = 12000, on_line=None) -> str:
     """Run a tool and return its result as a string (errors included, never raises)."""
     try:
         fn = _IMPLS.get(name)
         if fn is None:
             return f"Error: unknown tool '{name}'"
-        result = fn(args)
+        result = fn(args, on_line=on_line) if name == "bash" else fn(args)
         return _truncate(result, max_chars)
     except Exception as e:
         return f"Error: {type(e).__name__}: {e}"
@@ -252,14 +338,45 @@ def _resolve(path: str) -> str:
     return path
 
 
-def _bash(args: dict) -> str:
+# Background processes: id -> {"proc", "log", "command"}
+_BG_PROCS: dict[int, dict] = {}
+_BG_NEXT_ID = [1]
+
+
+def _kill_group(proc):
+    import os as _os
+    import signal
+    try:
+        _os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def _bash(args: dict, on_line=None) -> str:
     import os as _os
     import shlex
-    import signal
+    import tempfile
+    import threading
     timeout = int(args.get("timeout") or 120)
     cwd = _SHELL["cwd"] or _os.getcwd()
     if not _os.path.isdir(cwd):
         cwd = _os.getcwd()
+
+    if args.get("run_in_background"):
+        log = tempfile.NamedTemporaryFile(
+            mode="w", prefix="clyde-bg-", suffix=".log", delete=False)
+        proc = subprocess.Popen(
+            ["bash", "-c", f"cd {shlex.quote(cwd)} 2>/dev/null\n{args['command']}"],
+            stdout=log, stderr=subprocess.STDOUT, text=True,
+            start_new_session=True,
+        )
+        bg_id = _BG_NEXT_ID[0]
+        _BG_NEXT_ID[0] += 1
+        _BG_PROCS[bg_id] = {"proc": proc, "log": log.name,
+                            "command": args["command"][:120]}
+        return (f"Started background process #{bg_id} (pid {proc.pid}). "
+                f"Use bash_output with id={bg_id} to check on it.")
+
     wrapped = (
         f"cd {shlex.quote(cwd)} 2>/dev/null\n"
         f"{args['command']}\n"
@@ -267,21 +384,38 @@ def _bash(args: dict) -> str:
     )
     proc = subprocess.Popen(
         ["bash", "-c", wrapped],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         start_new_session=True,  # own process group: timeouts kill children too
     )
+    timed_out = threading.Event()
+
+    def _on_timeout():
+        timed_out.set()
+        _kill_group(proc)
+
+    timer = threading.Timer(timeout, _on_timeout)
+    timer.start()
+    lines: list[str] = []
+    pending_blanks = 0  # hold blanks: the cwd marker's printf adds one
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        try:
-            _os.killpg(proc.pid, signal.SIGKILL)
-        except OSError:
-            pass
-        try:
-            proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
+        for line in proc.stdout:
+            lines.append(line)
+            if not on_line or _CWD_MARKER in line:
+                continue
+            if not line.strip():
+                pending_blanks += 1
+                continue
+            for _ in range(pending_blanks):
+                on_line("")
+            pending_blanks = 0
+            on_line(line.rstrip("\n"))
+        proc.wait()
+    finally:
+        timer.cancel()
+    if timed_out.is_set():
         return f"Error: command timed out after {timeout}s (process group killed)"
+
+    stdout = "".join(lines)
     marker_at = stdout.rfind(_CWD_MARKER)
     if marker_at >= 0:
         new_cwd = stdout[marker_at + len(_CWD_MARKER):].strip()
@@ -289,11 +423,35 @@ def _bash(args: dict) -> str:
             _SHELL["cwd"] = new_cwd
         stdout = stdout[:marker_at].rstrip("\n")
     out = stdout
-    if stderr:
-        out += ("\n" if out else "") + stderr
     if proc.returncode != 0:
         out += f"\n[exit code {proc.returncode}]"
     return out.strip() or "(no output)"
+
+
+def _bash_output(args: dict) -> str:
+    bg = _BG_PROCS.get(int(args.get("id", 0)))
+    if not bg:
+        return f"Error: no background process #{args.get('id')}"
+    running = bg["proc"].poll() is None
+    try:
+        with open(bg["log"], "r", errors="replace") as f:
+            content = f.read()
+    except OSError:
+        content = "(no output captured)"
+    tail = content[-6000:]
+    status = "still running" if running \
+        else f"exited with code {bg['proc'].returncode}"
+    return f"[{bg['command']}] {status}\n{tail or '(no output yet)'}"
+
+
+def _bash_kill(args: dict) -> str:
+    bg = _BG_PROCS.get(int(args.get("id", 0)))
+    if not bg:
+        return f"Error: no background process #{args.get('id')}"
+    if bg["proc"].poll() is None:
+        _kill_group(bg["proc"])
+        return f"Killed background process #{args['id']}"
+    return f"Background process #{args['id']} had already exited"
 
 
 def _read_file(args: dict) -> str:
@@ -451,6 +609,8 @@ def _todo_write(args: dict) -> str:
 
 _IMPLS = {
     "bash": _bash,
+    "bash_output": _bash_output,
+    "bash_kill": _bash_kill,
     "todo_write": _todo_write,
     "read_file": _read_file,
     "write_file": _write_file,

@@ -56,6 +56,8 @@ Commands:
   /models            list models available on the current backend
   /context           show context window usage and history size
   /resume            pick an earlier session to continue
+  /undo              revert the last file edit/write
+  /mcp               list connected MCP servers and their tools
   /clear             clear conversation history (and file-read tracking)
   /compact           summarize the conversation to free up context
   /yolo              toggle auto-approval of tools
@@ -109,6 +111,15 @@ def _handle_slash(cmd: str, agent: Agent, cfg: dict, state: dict, console: Conso
             console.print(f"[red]{e}[/red]")
     elif name == "/context":
         agent.print_context()
+    elif name == "/undo":
+        agent.undo()
+    elif name == "/mcp":
+        if not agent.mcp_servers:
+            console.print("[dim]No MCP servers configured "
+                          "(add mcp_servers to the config).[/dim]")
+        for sname, server in agent.mcp_servers.items():
+            tool_names = ", ".join(t["name"] for t in server.tools) or "(none)"
+            console.print(f"  [bold]{sname}[/bold]: {tool_names}")
     elif name == "/resume":
         sessions = session_mod.list_sessions(cwd=agent.cwd) \
             or session_mod.list_sessions()
@@ -187,6 +198,9 @@ def main():
         sys.exit(1)
 
     agent = Agent(provider, console, cfg, yolo=args.yolo)
+    if cfg.get("mcp_servers"):
+        from . import mcp
+        agent.mcp_servers = mcp.load_servers(cfg, console)
 
     session_path = session_mod.new_session_path()
     if args.cont:
