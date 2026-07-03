@@ -36,6 +36,9 @@ DEFAULT_CONFIG = {
             "api_key_env": "OPENROUTER_API_KEY",
         },
     },
+    # Tool calls matching these rules run without an approval prompt.
+    # Forms: "edit_file" (whole tool) or "bash(git *)" (command prefix).
+    "permissions": {"allow": []},
     "auto_start_ollama": True,
     "max_tool_output_chars": 12000,
     "max_iterations": 40,
@@ -80,6 +83,28 @@ def load_config() -> dict:
             f"{e.msg}. Fix it or delete the file to regenerate defaults."
         ) from e
     return _deep_merge(json.loads(json.dumps(DEFAULT_CONFIG)), user_cfg)
+
+
+def save_config(cfg: dict):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, CONFIG_PATH)
+
+
+def rule_matches(rule: str, name: str, args: dict) -> bool:
+    """Permission rule check: "edit_file" or "bash(git *)" (prefix)."""
+    if "(" not in rule:
+        return rule == name
+    rule_tool, _, pattern = rule.partition("(")
+    pattern = pattern.rstrip(")")
+    if rule_tool != name:
+        return False
+    target = args.get("command", "") if name == "bash" else str(args.get("path", ""))
+    if pattern.endswith("*"):
+        return target.startswith(pattern[:-1])
+    return target == pattern
 
 
 def get_profile(cfg: dict, name: str) -> dict:

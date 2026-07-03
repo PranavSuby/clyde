@@ -9,15 +9,44 @@ Usage:
 """
 
 import argparse
+import os
+import re
 import sys
+import time
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from rich.console import Console
+from rich.markup import escape
 
-from . import __version__, config
+from . import __version__, config, session as session_mod, tools
 from .agent import Agent
 from .providers import ProviderError, ensure_ollama_running, make_provider
+
+_MENTION_RE = re.compile(r"@([~\w./\\-]+)")
+
+
+def expand_mentions(text: str, console: Console) -> str:
+    """Inline @path mentions: append file contents so the model doesn't
+    need a read_file round-trip (expensive on slow local models)."""
+    blocks = []
+    for raw in dict.fromkeys(_MENTION_RE.findall(text)):
+        path = os.path.expanduser(raw)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", errors="replace") as f:
+                content = f.read()
+        except OSError:
+            continue
+        if len(content) > 20000:
+            content = content[:20000] + "\n... (file truncated at 20k chars)"
+        tools._mark_read(path)  # mentioned file may be edited without re-read
+        blocks.append(f"--- {raw} ---\n{content}")
+        console.print(f"[dim]attached {raw} ({len(content)} chars)[/dim]")
+    if blocks:
+        return text + "\n\nAttached files:\n" + "\n\n".join(blocks)
+    return text
 
 HELP = """\
 Commands:
@@ -26,10 +55,12 @@ Commands:
   /model [name]      show or switch model within the current profile
   /models            list models available on the current backend
   /context           show context window usage and history size
+  /resume            pick an earlier session to continue
   /clear             clear conversation history (and file-read tracking)
   /compact           summarize the conversation to free up context
   /yolo              toggle auto-approval of tools
   /exit              quit (also Ctrl-D)
+@path/to/file in a message attaches that file's contents.
 Anything else is sent to the model. Ctrl-C interrupts a running response."""
 
 
@@ -78,6 +109,29 @@ def _handle_slash(cmd: str, agent: Agent, cfg: dict, state: dict, console: Conso
             console.print(f"[red]{e}[/red]")
     elif name == "/context":
         agent.print_context()
+    elif name == "/resume":
+        sessions = session_mod.list_sessions(cwd=agent.cwd) \
+            or session_mod.list_sessions()
+        if not sessions:
+            console.print("[dim]No saved sessions yet.[/dim]")
+            return True
+        for i, s in enumerate(sessions, 1):
+            age = time.strftime("%b %d %H:%M", time.localtime(s["updated"]))
+            console.print(
+                f"  [bold]{i}[/bold]. {age} · {s['turns']} turns · "
+                f"[cyan]{s['model']}[/cyan] · {escape(s['first_prompt'][:60])}"
+            )
+        try:
+            pick = console.input("[yellow]Resume which? (number/blank)[/yellow] ").strip()
+        except EOFError:
+            return True
+        if pick.isdigit() and 1 <= int(pick) <= len(sessions):
+            chosen = sessions[int(pick) - 1]
+            data = session_mod.load(chosen["path"])
+            agent.messages = data["messages"]
+            state["session_path"] = chosen["path"]
+            console.print(f"[dim]Resumed {chosen['path']} "
+                          f"({chosen['turns']} turns).[/dim]")
     elif name == "/model":
         if not arg:
             console.print(f"Model: [bold]{agent.provider.model}[/bold]")
@@ -112,6 +166,8 @@ def main():
     parser.add_argument("prompt", nargs="*", help="one-shot prompt (omit for REPL)")
     parser.add_argument("-P", "--profile", default=None, help="config profile to use")
     parser.add_argument("-m", "--model", default=None, help="override the profile's model")
+    parser.add_argument("-c", "--continue", dest="cont", action="store_true",
+                        help="continue the most recent session in this directory")
     parser.add_argument("--yolo", action="store_true", help="auto-approve all tool calls")
     parser.add_argument("--version", action="version", version=f"clyde {__version__}")
     args = parser.parse_args()
@@ -132,6 +188,26 @@ def main():
 
     agent = Agent(provider, console, cfg, yolo=args.yolo)
 
+    session_path = session_mod.new_session_path()
+    if args.cont:
+        recent = session_mod.list_sessions(cwd=os.getcwd(), limit=1)
+        if recent:
+            data = session_mod.load(recent[0]["path"])
+            agent.messages = data["messages"]
+            session_path = recent[0]["path"]
+            console.print(f"[dim]Continuing session with "
+                          f"{recent[0]['turns']} prior turns.[/dim]")
+        else:
+            console.print("[dim]No previous session here; starting fresh.[/dim]")
+
+    def save_session():
+        try:
+            session_mod.save(state["session_path"], agent, state["profile"])
+        except OSError as e:
+            console.print(f"[dim]session save failed: {e}[/dim]")
+
+    state = {"profile": profile_name, "session_path": session_path}
+
     # One-shot mode
     if args.prompt:
         if not args.yolo and not sys.stdin.isatty():
@@ -140,7 +216,8 @@ def main():
                 "answered. Re-run with --yolo for non-interactive use.[/red]"
             )
             sys.exit(2)
-        agent.run_turn(" ".join(args.prompt))
+        agent.run_turn(expand_mentions(" ".join(args.prompt), console))
+        save_session()
         sys.exit(1 if agent.had_error else 0)
 
     console.print(
@@ -150,7 +227,6 @@ def main():
     )
 
     session = PromptSession(history=FileHistory(config.HISTORY_PATH))
-    state = {"profile": profile_name}
 
     def rprompt():
         pct = agent.ctx_percent()
@@ -171,9 +247,10 @@ def main():
         if line.startswith("/"):
             if not _handle_slash(line, agent, cfg, state, console):
                 break
+            save_session()
             continue
         try:
-            agent.run_turn(line)
+            agent.run_turn(expand_mentions(line, console))
         except KeyboardInterrupt:
             console.print("\n[yellow]Interrupted.[/yellow]")
         except Exception as e:  # never lose the session to a bug
@@ -183,6 +260,7 @@ def main():
                 f"[red]Internal error ({type(e).__name__}) — session preserved. "
                 f"Please report the traceback above.[/red]"
             )
+        save_session()
 
     console.print("[dim]bye[/dim]")
 

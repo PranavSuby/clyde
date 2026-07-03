@@ -239,12 +239,34 @@ def execute(name: str, args: dict, max_chars: int = 12000) -> str:
         return f"Error: {type(e).__name__}: {e}"
 
 
+# cwd persists between bash calls so `cd` behaves the way models expect
+_SHELL = {"cwd": None}
+_CWD_MARKER = "__CLYDE_CWD__"
+
+
+def _resolve(path: str) -> str:
+    """Expand ~ and resolve relative paths against the persistent shell cwd."""
+    path = os.path.expanduser(path)
+    if not os.path.isabs(path):
+        path = os.path.join(_SHELL["cwd"] or os.getcwd(), path)
+    return path
+
+
 def _bash(args: dict) -> str:
     import os as _os
+    import shlex
     import signal
     timeout = int(args.get("timeout") or 120)
+    cwd = _SHELL["cwd"] or _os.getcwd()
+    if not _os.path.isdir(cwd):
+        cwd = _os.getcwd()
+    wrapped = (
+        f"cd {shlex.quote(cwd)} 2>/dev/null\n"
+        f"{args['command']}\n"
+        f"__rc=$?; printf '\\n{_CWD_MARKER}%s' \"$PWD\"; exit $__rc"
+    )
     proc = subprocess.Popen(
-        ["bash", "-c", args["command"]],
+        ["bash", "-c", wrapped],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         start_new_session=True,  # own process group: timeouts kill children too
     )
@@ -260,6 +282,12 @@ def _bash(args: dict) -> str:
         except subprocess.TimeoutExpired:
             pass
         return f"Error: command timed out after {timeout}s (process group killed)"
+    marker_at = stdout.rfind(_CWD_MARKER)
+    if marker_at >= 0:
+        new_cwd = stdout[marker_at + len(_CWD_MARKER):].strip()
+        if new_cwd:
+            _SHELL["cwd"] = new_cwd
+        stdout = stdout[:marker_at].rstrip("\n")
     out = stdout
     if stderr:
         out += ("\n" if out else "") + stderr
@@ -269,7 +297,7 @@ def _bash(args: dict) -> str:
 
 
 def _read_file(args: dict) -> str:
-    path = os.path.expanduser(args["path"])
+    path = _resolve(args["path"])
     offset = max(1, int(args.get("offset") or 1))
     limit = int(args.get("limit") or 1000)
     with open(path, "r", errors="replace") as f:
@@ -287,7 +315,7 @@ def _read_file(args: dict) -> str:
 
 
 def _write_file(args: dict) -> str:
-    path = os.path.expanduser(args["path"])
+    path = _resolve(args["path"])
     gate = _check_read_gate(path)
     if gate:
         return gate + " (Use read_file first, then edit_file for changes.)"
@@ -301,7 +329,7 @@ def _write_file(args: dict) -> str:
 
 
 def _edit_file(args: dict) -> str:
-    path = os.path.expanduser(args["path"])
+    path = _resolve(args["path"])
     gate = _check_read_gate(path)
     if gate:
         return gate
@@ -337,7 +365,7 @@ def _edit_file(args: dict) -> str:
 
 
 def _list_dir(args: dict) -> str:
-    path = os.path.expanduser(args.get("path") or ".")
+    path = _resolve(args.get("path") or ".")
     entries = sorted(os.listdir(path))
     if not entries:
         return "(empty directory)"
@@ -349,7 +377,7 @@ def _list_dir(args: dict) -> str:
 
 
 def _glob(args: dict) -> str:
-    root = os.path.expanduser(args.get("path") or ".")
+    root = _resolve(args.get("path") or ".")
     matches = globmod.glob(args["pattern"], root_dir=root, recursive=True)
     matches = [
         m for m in matches
@@ -367,7 +395,7 @@ def _glob(args: dict) -> str:
 
 def _grep(args: dict) -> str:
     pattern = args["pattern"]
-    path = os.path.expanduser(args.get("path") or ".")
+    path = _resolve(args.get("path") or ".")
     include = args.get("include")
 
     rg = shutil.which("rg")

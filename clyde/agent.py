@@ -5,11 +5,13 @@ import json
 import os
 import platform
 import subprocess
+import time
 
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
 
+from . import config as config_mod
 from . import tools
 from .providers import BaseProvider, ProviderError
 
@@ -124,6 +126,63 @@ directory shown below.
 """
 
 
+class StreamStyler:
+    """Style streamed text line-by-line without buffering whole responses:
+    code-fence contents cyan, fence markers dim, headers bold. Holds back at
+    most the first few chars of each line to classify it, so streaming stays
+    live."""
+
+    def __init__(self):
+        self.line_start = True
+        self.hold = ""
+        self.in_fence = False
+        self.line_style = None
+
+    def _classify(self):
+        stripped = self.hold.lstrip()
+        if stripped.startswith("```"):
+            self.in_fence = not self.in_fence
+            self.line_style = "bright_black"
+        elif self.in_fence:
+            self.line_style = "cyan"
+        elif stripped.startswith("#"):
+            self.line_style = "bold"
+        else:
+            self.line_style = None
+
+    def feed(self, s: str) -> list[tuple[str, str | None]]:
+        out = []
+        while s:
+            if self.line_start:
+                nl = s.find("\n")
+                take = s if nl == -1 else s[:nl + 1]
+                self.hold += take
+                s = "" if nl == -1 else s[nl + 1:]
+                complete = self.hold.endswith("\n")
+                if complete or len(self.hold.lstrip()) >= 3 or len(self.hold) >= 8:
+                    self._classify()
+                    out.append((self.hold, self.line_style))
+                    self.hold = ""
+                    self.line_start = complete
+            else:
+                nl = s.find("\n")
+                if nl == -1:
+                    out.append((s, self.line_style))
+                    s = ""
+                else:
+                    out.append((s[:nl + 1], self.line_style))
+                    s = s[nl + 1:]
+                    self.line_start = True
+        return out
+
+    def flush(self) -> list[tuple[str, str | None]]:
+        if not self.hold:
+            return []
+        self._classify()
+        held, self.hold = self.hold, ""
+        return [(held, self.line_style)]
+
+
 def build_system_prompt(cwd: str) -> str:
     git_info = "no"
     try:
@@ -216,14 +275,25 @@ class Agent:
 
     def _print_stream(self, kind: str, text: str, state: dict):
         """Print streamed tokens, tracking whether we're mid-line."""
-        style = "dim italic" if kind == "thinking" else None
         if state.get("last_kind") not in (None, kind):
             self.console.print()  # separate thinking from answer
         state["last_kind"] = kind
-        self.console.print(text, style=style, end="", markup=False, highlight=False)
+        if kind == "thinking":
+            self.console.print(text, style="dim italic", end="",
+                               markup=False, highlight=False)
+        else:
+            styler = state.setdefault("styler", StreamStyler())
+            for segment, style in styler.feed(text):
+                self.console.print(segment, style=style, end="",
+                                   markup=False, highlight=False)
         state["midline"] = not text.endswith("\n")
 
     def _end_stream(self, state: dict):
+        styler = state.get("styler")
+        if styler:
+            for segment, style in styler.flush():
+                self.console.print(segment, style=style, end="",
+                                   markup=False, highlight=False)
         if state.get("midline"):
             self.console.print()
             state["midline"] = False
@@ -234,24 +304,84 @@ class Agent:
             return text
         return text[:limit] + f"\n… (+{len(text) - limit} more chars)"
 
+    def _diff_preview(self, args: dict, is_edit: bool) -> str | None:
+        """Unified diff of what the change would do, as a Rich markup string."""
+        import difflib
+        path = tools._resolve(str(args.get("path", "")))
+        try:
+            with open(path, "r", newline="") as f:
+                old_content = f.read().replace("\r\n", "\n")
+        except (OSError, UnicodeDecodeError):
+            return None
+        if is_edit:
+            old_s = args.get("old_string", "").replace("\r\n", "\n")
+            new_s = args.get("new_string", "").replace("\r\n", "\n")
+            if args.get("replace_all"):
+                new_content = old_content.replace(old_s, new_s)
+            else:
+                new_content = old_content.replace(old_s, new_s, 1)
+            if new_content == old_content:
+                return None  # old_string not found; the tool will explain
+        else:
+            new_content = args.get("content", "")
+        lines = list(difflib.unified_diff(
+            old_content.splitlines(), new_content.splitlines(),
+            lineterm="", n=3,
+        ))[2:]  # drop ---/+++ header
+        if not lines:
+            return None
+        if len(lines) > 80:
+            lines = lines[:80] + [f"… ({len(lines) - 80} more diff lines)"]
+        styled = []
+        for line in lines:
+            e = escape(line)
+            if line.startswith("+"):
+                styled.append(f"[green]{e}[/green]")
+            elif line.startswith("-"):
+                styled.append(f"[red]{e}[/red]")
+            elif line.startswith("@@"):
+                styled.append(f"[cyan]{e}[/cyan]")
+            else:
+                styled.append(e)
+        return "\n".join(styled)
+
+    def _rule_for(self, name: str, args: dict) -> str:
+        """The allow-rule suggestion for the 'p' (persist) approval answer."""
+        if name == "bash":
+            first = (args.get("command", "").strip().split() or ["?"])[0]
+            return f"bash({first} *)"
+        return name
+
     def _approve(self, name: str, args: dict) -> bool:
         if self.yolo or name in self.session_allow \
                 or name not in tools.APPROVAL_REQUIRED:
             return True
-        if name == "edit_file":
-            body = (
-                f"[red]- {escape(self._clip(args.get('old_string', ''), 1500))}[/red]\n"
-                f"[green]+ {escape(self._clip(args.get('new_string', ''), 1500))}[/green]"
-            )
-            self.console.print(Panel(body, title=f"edit {args.get('path', '')}",
-                                     border_style="yellow"))
-        elif name == "write_file":
-            preview = escape(self._clip(args.get("content", ""), 2000))
-            self.console.print(Panel(preview, title=f"write {args.get('path', '')}",
-                                     border_style="yellow"))
+        for rule in self.cfg.get("permissions", {}).get("allow", []):
+            if config_mod.rule_matches(rule, name, args):
+                return True
+        if name in ("edit_file", "write_file"):
+            diff = self._diff_preview(args, is_edit=(name == "edit_file"))
+            if diff is not None:
+                self.console.print(Panel(
+                    diff, title=f"{name.split('_')[0]} {args.get('path', '')}",
+                    border_style="yellow"))
+            elif name == "edit_file":
+                body = (
+                    f"[red]- {escape(self._clip(args.get('old_string', ''), 1500))}[/red]\n"
+                    f"[green]+ {escape(self._clip(args.get('new_string', ''), 1500))}[/green]"
+                )
+                self.console.print(Panel(body, title=f"edit {args.get('path', '')}",
+                                         border_style="yellow"))
+            else:
+                preview = escape(self._clip(args.get("content", ""), 2000))
+                self.console.print(Panel(
+                    preview, title=f"write new file {args.get('path', '')}",
+                    border_style="yellow"))
+        persist_rule = self._rule_for(name, args)
         try:
             answer = self.console.input(
-                f"[yellow]Allow {name}? \\[y/n/a=always allow {name}][/yellow] "
+                f"[yellow]Allow {name}? \\[y/n/a=always allow {name} this session"
+                f"/p=permanently allow {escape(persist_rule)}][/yellow] "
             ).strip().lower()
         except EOFError:
             return False
@@ -259,6 +389,14 @@ class Agent:
             self.session_allow.add(name)
             self.console.print(f"[dim]{name} auto-approved for this session "
                                f"(/yolo for everything)[/dim]")
+            return True
+        if answer == "p":
+            allow = self.cfg.setdefault("permissions", {}).setdefault("allow", [])
+            if persist_rule not in allow:
+                allow.append(persist_rule)
+                config_mod.save_config(self.cfg)
+            self.console.print(f"[dim]saved allow rule: {escape(persist_rule)} "
+                               f"({config_mod.CONFIG_PATH})[/dim]")
             return True
         return answer in ("y", "yes")
 
@@ -280,9 +418,25 @@ class Agent:
             )
             self.compact()
 
+    @staticmethod
+    def _is_retryable(err: Exception) -> bool:
+        s = str(err)
+        return any(marker in s for marker in
+                   ("429", "500", "502", "503", "504", "Cannot reach",
+                    "overloaded", "timed out"))
+
+    @staticmethod
+    def _is_context_overflow(err: Exception) -> bool:
+        s = str(err).lower()
+        return any(marker in s for marker in
+                   ("context length", "context_length", "too long",
+                    "maximum context", "context window"))
+
     def _run_turn(self, user_input: str):
         self.messages.append({"role": "user", "content": user_input})
         self._trim_history()
+        retries_left = 2
+        compacted_already = False
 
         for _ in range(self.cfg.get("max_iterations", 40)):
             text_parts: list[str] = []
@@ -311,6 +465,25 @@ class Agent:
                     self._print_stream(fkind, ftext, state)
             except ProviderError as e:
                 self._end_stream(state)
+                nothing_streamed = not text_parts and not tool_calls
+                if nothing_streamed and self._is_context_overflow(e) \
+                        and not compacted_already and len(self.messages) > 3 \
+                        and self.messages[-1]["role"] == "user":
+                    compacted_already = True
+                    self.console.print("[yellow]Context overflow — "
+                                       "compacting and retrying...[/yellow]")
+                    pending = self.messages.pop()  # keep the question verbatim
+                    self.compact()
+                    self.messages.append(pending)
+                    continue
+                if nothing_streamed and retries_left > 0 and self._is_retryable(e):
+                    retries_left -= 1
+                    delay = 2 ** (2 - retries_left)
+                    self.console.print(f"[yellow]Transient provider error, "
+                                       f"retrying in {delay}s...[/yellow] "
+                                       f"[dim]{escape(str(e)[:120])}[/dim]")
+                    time.sleep(delay)
+                    continue
                 self.had_error = True
                 self.console.print(f"[red]Provider error:[/red] {escape(str(e))}")
                 # keep history consistent: drop nothing, just stop the turn
