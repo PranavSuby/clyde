@@ -1,0 +1,172 @@
+"""clyde: a minimal Claude Code-style terminal coding agent.
+
+Usage:
+  clyde                      # interactive REPL (default profile)
+  clyde -P cloud             # use the 'cloud' profile
+  clyde -m qwen3:8b          # override the model
+  clyde "fix the tests"      # one-shot mode
+  clyde --yolo               # skip approval prompts
+"""
+
+import argparse
+import sys
+
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import FileHistory
+from rich.console import Console
+
+from . import __version__, config
+from .agent import Agent
+from .providers import ProviderError, ensure_ollama_running, make_provider
+
+HELP = """\
+Commands:
+  /help              show this help
+  /profile [name]    show or switch profile (local, cloud, ...)
+  /model [name]      show or switch model within the current profile
+  /models            list models available on the current backend
+  /context           show context window usage and history size
+  /clear             clear conversation history (and file-read tracking)
+  /compact           summarize the conversation to free up context
+  /yolo              toggle auto-approval of tools
+  /exit              quit (also Ctrl-D)
+Anything else is sent to the model. Ctrl-C interrupts a running response."""
+
+
+def _setup_provider(cfg, profile_name, model_override, console):
+    profile = config.get_profile(cfg, profile_name)
+    if profile.get("type") == "ollama":
+        if not ensure_ollama_running(profile["base_url"], cfg.get("auto_start_ollama", True)):
+            console.print(
+                f"[red]Ollama is not reachable at {profile['base_url']} "
+                f"and could not be started.[/red]"
+            )
+            sys.exit(1)
+    provider = make_provider(profile, model_override)
+    _resolve_ctx(provider, cfg, console)
+    return provider, profile
+
+
+def _resolve_ctx(provider, cfg, console):
+    if hasattr(provider, "resolve_num_ctx"):
+        _, note = provider.resolve_num_ctx(cfg.get("auto_ctx_cap", 65536))
+        console.print(f"[dim]num_ctx: {note}[/dim]")
+
+
+def _handle_slash(cmd: str, agent: Agent, cfg: dict, state: dict, console: Console) -> bool:
+    """Handle a slash command. Returns False if the REPL should exit."""
+    parts = cmd.split(maxsplit=1)
+    name, arg = parts[0], (parts[1].strip() if len(parts) > 1 else "")
+
+    if name in ("/exit", "/quit", "/q"):
+        return False
+    if name == "/help":
+        console.print(HELP)
+    elif name == "/clear":
+        agent.clear()
+        console.print("[dim]History cleared.[/dim]")
+    elif name == "/compact":
+        agent.compact()
+    elif name == "/yolo":
+        agent.yolo = not agent.yolo
+        console.print(f"[dim]Auto-approve: {'on' if agent.yolo else 'off'}[/dim]")
+    elif name == "/models":
+        try:
+            for m in agent.provider.list_models():
+                console.print(f"  {m}")
+        except ProviderError as e:
+            console.print(f"[red]{e}[/red]")
+    elif name == "/context":
+        agent.print_context()
+    elif name == "/model":
+        if not arg:
+            console.print(f"Model: [bold]{agent.provider.model}[/bold]")
+        else:
+            agent.provider.model = arg
+            console.print(f"[dim]Model set to {arg}[/dim]")
+            _resolve_ctx(agent.provider, cfg, console)
+    elif name == "/profile":
+        if not arg:
+            console.print(
+                f"Profile: [bold]{state['profile']}[/bold] "
+                f"(available: {', '.join(cfg['profiles'])})"
+            )
+        else:
+            try:
+                provider, _ = _setup_provider(cfg, arg, None, console)
+            except (KeyError, ProviderError) as e:
+                console.print(f"[red]{e}[/red]")
+                return True
+            agent.provider = provider
+            state["profile"] = arg
+            console.print(f"[dim]Switched to profile '{arg}' (model {provider.model})[/dim]")
+    else:
+        console.print(f"[red]Unknown command {name}. Try /help[/red]")
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="clyde", description=__doc__)
+    parser.add_argument("prompt", nargs="*", help="one-shot prompt (omit for REPL)")
+    parser.add_argument("-P", "--profile", default=None, help="config profile to use")
+    parser.add_argument("-m", "--model", default=None, help="override the profile's model")
+    parser.add_argument("--yolo", action="store_true", help="auto-approve all tool calls")
+    parser.add_argument("--version", action="version", version=f"clyde {__version__}")
+    args = parser.parse_args()
+
+    console = Console()
+    cfg = config.load_config()
+    profile_name = args.profile or cfg.get("default_profile", "local")
+
+    try:
+        provider, _profile = _setup_provider(cfg, profile_name, args.model, console)
+    except (KeyError, ProviderError) as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+
+    agent = Agent(provider, console, cfg, yolo=args.yolo)
+
+    # One-shot mode
+    if args.prompt:
+        agent.run_turn(" ".join(args.prompt))
+        return
+
+    console.print(
+        f"[bold]clyde[/bold] v{__version__} · profile [cyan]{profile_name}[/cyan] "
+        f"· model [cyan]{provider.model}[/cyan]\n"
+        f"[dim]/help for commands · config: {config.CONFIG_PATH}[/dim]"
+    )
+
+    session = PromptSession(history=FileHistory(config.HISTORY_PATH))
+    state = {"profile": profile_name}
+
+    def rprompt():
+        pct = agent.ctx_percent()
+        label = agent.provider.model
+        if pct is not None:
+            label += f" · ctx {pct}%"
+        return label
+
+    while True:
+        try:
+            line = session.prompt("\n❯ ", rprompt=rprompt).strip()
+        except KeyboardInterrupt:
+            continue
+        except EOFError:
+            break
+        if not line:
+            continue
+        if line.startswith("/"):
+            if not _handle_slash(line, agent, cfg, state, console):
+                break
+            continue
+        try:
+            agent.run_turn(line)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Interrupted.[/yellow]")
+
+    console.print("[dim]bye[/dim]")
+
+
+if __name__ == "__main__":
+    main()
