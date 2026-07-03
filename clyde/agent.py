@@ -7,6 +7,7 @@ import platform
 import subprocess
 
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 
 from . import tools
@@ -175,6 +176,8 @@ class Agent:
         self.yolo = yolo
         self.cwd = os.getcwd()
         self.last_usage: dict = {}
+        self.session_allow: set[str] = set()
+        self.had_error = False
         self.messages: list[dict] = [
             {"role": "system", "content": build_system_prompt(self.cwd)}
         ]
@@ -184,12 +187,28 @@ class Agent:
         self.last_usage = {}
         tools._READ_FILES.clear()
 
+    def _context_size(self) -> int | None:
+        """The window we're budgeting against, for any provider type."""
+        return getattr(self.provider, "num_ctx", None) \
+            or getattr(self.provider, "context_window", None)
+
+    def _estimated_prompt_tokens(self) -> int:
+        """Client-side estimate (~3.5 chars/token). Backstop for providers
+        that under-report (Ollama omits KV-cache-hit tokens) or not at all."""
+        chars = sum(
+            len(str(m.get("content") or ""))
+            + (len(json.dumps(m["tool_calls"])) if m.get("tool_calls") else 0)
+            for m in self.messages
+        )
+        return int(chars / 3.5)
+
     def ctx_percent(self) -> int | None:
-        num_ctx = getattr(self.provider, "num_ctx", None)
-        pt = self.last_usage.get("prompt_tokens")
-        if num_ctx and pt:
-            return round(100 * pt / num_ctx)
-        return None
+        window = self._context_size()
+        if not window:
+            return None
+        pt = max(self.last_usage.get("prompt_tokens") or 0,
+                 self._estimated_prompt_tokens())
+        return round(100 * pt / window) if pt else None
 
     # ------------------------------------------------------------------
     # Rendering helpers
@@ -209,28 +228,37 @@ class Agent:
             self.console.print()
             state["midline"] = False
 
+    @staticmethod
+    def _clip(text: str, limit: int) -> str:
+        if len(text) <= limit:
+            return text
+        return text[:limit] + f"\n… (+{len(text) - limit} more chars)"
+
     def _approve(self, name: str, args: dict) -> bool:
-        if self.yolo or name not in tools.APPROVAL_REQUIRED:
+        if self.yolo or name in self.session_allow \
+                or name not in tools.APPROVAL_REQUIRED:
             return True
         if name == "edit_file":
             body = (
-                f"[red]- {args.get('old_string', '')[:1000]}[/red]\n"
-                f"[green]+ {args.get('new_string', '')[:1000]}[/green]"
+                f"[red]- {escape(self._clip(args.get('old_string', ''), 1500))}[/red]\n"
+                f"[green]+ {escape(self._clip(args.get('new_string', ''), 1500))}[/green]"
             )
             self.console.print(Panel(body, title=f"edit {args.get('path', '')}",
                                      border_style="yellow"))
         elif name == "write_file":
-            preview = args.get("content", "")[:1500]
+            preview = escape(self._clip(args.get("content", ""), 2000))
             self.console.print(Panel(preview, title=f"write {args.get('path', '')}",
                                      border_style="yellow"))
         try:
             answer = self.console.input(
-                f"[yellow]Allow {name}? \\[y/n/a=always][/yellow] "
+                f"[yellow]Allow {name}? \\[y/n/a=always allow {name}][/yellow] "
             ).strip().lower()
         except EOFError:
             return False
         if answer == "a":
-            self.yolo = True
+            self.session_allow.add(name)
+            self.console.print(f"[dim]{name} auto-approved for this session "
+                               f"(/yolo for everything)[/dim]")
             return True
         return answer in ("y", "yes")
 
@@ -239,13 +267,15 @@ class Agent:
     # ------------------------------------------------------------------
 
     def run_turn(self, user_input: str):
+        self.had_error = False
         self._run_turn(user_input)
         threshold = self.cfg.get("auto_compact_threshold", 0.85)
-        num_ctx = getattr(self.provider, "num_ctx", None)
-        pt = self.last_usage.get("prompt_tokens", 0)
-        if threshold and num_ctx and pt > threshold * num_ctx:
+        window = self._context_size()
+        pt = max(self.last_usage.get("prompt_tokens") or 0,
+                 self._estimated_prompt_tokens())
+        if threshold and window and pt > threshold * window:
             self.console.print(
-                f"[yellow]Context {100 * pt / num_ctx:.0f}% full — "
+                f"[yellow]Context {100 * pt / window:.0f}% full — "
                 f"auto-compacting...[/yellow]"
             )
             self.compact()
@@ -281,12 +311,16 @@ class Agent:
                     self._print_stream(fkind, ftext, state)
             except ProviderError as e:
                 self._end_stream(state)
-                self.console.print(f"[red]Provider error:[/red] {e}")
+                self.had_error = True
+                self.console.print(f"[red]Provider error:[/red] {escape(str(e))}")
                 # keep history consistent: drop nothing, just stop the turn
                 return
             except KeyboardInterrupt:
                 self._end_stream(state)
                 self.console.print("[yellow]Interrupted.[/yellow]")
+                for fkind, ftext in think.flush():
+                    if fkind == "text":
+                        text_parts.append(ftext)
                 partial = "".join(text_parts).strip()
                 if partial:
                     self.messages.append({"role": "assistant", "content": partial})
@@ -330,8 +364,8 @@ class Agent:
     def _run_tool(self, tc: dict):
         name, args = tc["name"], tc["arguments"]
         self.console.print(
-            f"[bold cyan]●[/bold cyan] [bold]{name}[/bold]"
-            f"([white]{_args_preview(name, args)}[/white])",
+            f"[bold cyan]●[/bold cyan] [bold]{escape(name)}[/bold]"
+            f"([white]{escape(_args_preview(name, args))}[/white])",
             markup=True, highlight=False,
         )
         if self._approve(name, args):
@@ -384,9 +418,13 @@ class Agent:
             for fkind, ftext in think.flush():
                 if fkind == "text":
                     parts.append(ftext)
-        except (ProviderError, KeyboardInterrupt) as e:
+        except KeyboardInterrupt:
             self._end_stream(state)
-            self.console.print(f"[red]Compact failed: {e}[/red]")
+            self.console.print("[yellow]Compact interrupted; history unchanged.[/yellow]")
+            return
+        except ProviderError as e:
+            self._end_stream(state)
+            self.console.print(f"[red]Compact failed: {escape(str(e))}[/red]")
             return
         finally:
             self._end_stream(state)
@@ -407,7 +445,7 @@ class Agent:
 
     def print_context(self):
         """Show a context-usage report (/context)."""
-        num_ctx = getattr(self.provider, "num_ctx", None)
+        num_ctx = self._context_size()
         pt = self.last_usage.get("prompt_tokens")
         lines = [f"Model: {self.provider.model}"]
         if num_ctx:
@@ -443,9 +481,9 @@ class Agent:
         pt = usage.get("prompt_tokens") or 0
         rate = f" · {ct / secs:.0f} tok/s" if secs > 0 and ct else ""
         ctx = ""
-        num_ctx = getattr(self.provider, "num_ctx", None)
-        if num_ctx and pt:
-            ctx = f" · ctx {100 * pt / num_ctx:.0f}%"
+        window = self._context_size()
+        if window and pt:
+            ctx = f" · ctx {100 * max(pt, self._estimated_prompt_tokens()) / window:.0f}%"
         if pt or ct:
             self.console.print(
                 f"[dim]  {secs:.1f}s · {pt} prompt · {ct} gen{rate}{ctx}[/dim]"
@@ -453,8 +491,7 @@ class Agent:
 
     def _trim_history(self):
         """Drop oldest turns when history gets too big (rough char budget)."""
-        num_ctx = getattr(self.provider, "num_ctx", None) or 32768
-        budget = num_ctx * 3  # ~3 chars per token, conservative
+        budget = (self._context_size() or 32768) * 3  # ~3 chars/token, conservative
         def size(m):
             return len(str(m.get("content") or "")) + (
                 len(json.dumps(m["tool_calls"])) if m.get("tool_calls") else 0

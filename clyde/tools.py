@@ -189,9 +189,34 @@ APPROVAL_REQUIRED = {"bash", "write_file", "edit_file"}
 
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".cache", "dist", "build"}
 
-# Files the model has read this session; editing an existing file it hasn't
-# read is rejected so the model can't guess at contents.
-_READ_FILES: set[str] = set()
+# Files the model has read this session (realpath -> mtime at read time).
+# Editing an existing file it hasn't read — or one modified since the read —
+# is rejected so the model can't apply blind edits.
+_READ_FILES: dict[str, float] = {}
+
+
+def _mark_read(path: str):
+    rp = os.path.realpath(path)
+    try:
+        _READ_FILES[rp] = os.stat(rp).st_mtime
+    except OSError:
+        pass
+
+
+def _check_read_gate(path: str) -> str | None:
+    """Return an error string if the file may not be edited yet."""
+    rp = os.path.realpath(path)
+    if not os.path.exists(rp):
+        return None  # new file: no gate
+    if rp not in _READ_FILES:
+        return "Error: you must read this file with read_file before editing it."
+    try:
+        if os.stat(rp).st_mtime != _READ_FILES[rp]:
+            return ("Error: the file was modified since you last read it. "
+                    "Read it again before editing.")
+    except OSError:
+        pass
+    return None
 
 
 def _truncate(text: str, max_chars: int) -> str:
@@ -215,17 +240,29 @@ def execute(name: str, args: dict, max_chars: int = 12000) -> str:
 
 
 def _bash(args: dict) -> str:
+    import os as _os
+    import signal
     timeout = int(args.get("timeout") or 120)
+    proc = subprocess.Popen(
+        ["bash", "-c", args["command"]],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        start_new_session=True,  # own process group: timeouts kill children too
+    )
     try:
-        proc = subprocess.run(
-            ["bash", "-c", args["command"]],
-            capture_output=True, text=True, timeout=timeout,
-        )
+        stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        return f"Error: command timed out after {timeout}s"
-    out = proc.stdout
-    if proc.stderr:
-        out += ("\n" if out else "") + proc.stderr
+        try:
+            _os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        return f"Error: command timed out after {timeout}s (process group killed)"
+    out = stdout
+    if stderr:
+        out += ("\n" if out else "") + stderr
     if proc.returncode != 0:
         out += f"\n[exit code {proc.returncode}]"
     return out.strip() or "(no output)"
@@ -237,7 +274,7 @@ def _read_file(args: dict) -> str:
     limit = int(args.get("limit") or 1000)
     with open(path, "r", errors="replace") as f:
         lines = f.readlines()
-    _READ_FILES.add(os.path.abspath(path))
+    _mark_read(path)
     if not lines:
         return "(empty file)"
     chunk = lines[offset - 1 : offset - 1 + limit]
@@ -251,39 +288,50 @@ def _read_file(args: dict) -> str:
 
 def _write_file(args: dict) -> str:
     path = os.path.expanduser(args["path"])
-    abspath = os.path.abspath(path)
-    if os.path.exists(abspath) and abspath not in _READ_FILES:
-        return ("Error: this file already exists and you have not read it. "
-                "Use read_file first, then edit_file for changes.")
-    parent = os.path.dirname(abspath)
+    gate = _check_read_gate(path)
+    if gate:
+        return gate + " (Use read_file first, then edit_file for changes.)"
+    parent = os.path.dirname(os.path.abspath(path))
     os.makedirs(parent, exist_ok=True)
     content = args["content"]
-    with open(path, "w") as f:
+    with open(path, "w", newline="") as f:
         f.write(content)
-    _READ_FILES.add(abspath)
+    _mark_read(path)
     return f"Wrote {len(content)} chars to {path}"
 
 
 def _edit_file(args: dict) -> str:
     path = os.path.expanduser(args["path"])
-    if os.path.abspath(path) not in _READ_FILES:
-        return "Error: you must read this file with read_file before editing it."
+    gate = _check_read_gate(path)
+    if gate:
+        return gate
     old, new = args["old_string"], args["new_string"]
     if old == new:
         return "Error: old_string and new_string are identical"
-    with open(path, "r") as f:
-        content = f.read()
-    count = content.count(old)
+    try:
+        # newline="" preserves CRLF/LF exactly as on disk
+        with open(path, "r", newline="") as f:
+            raw = f.read()
+    except UnicodeDecodeError:
+        return "Error: file is not valid UTF-8 text; edit it with a bash command instead"
+    # match against LF-normalized text so old_string from read_file output
+    # works on CRLF files; write back with the file's original line endings
+    crlf = "\r\n" in raw
+    content = raw.replace("\r\n", "\n") if crlf else raw
+    old_n = old.replace("\r\n", "\n")
+    new_n = new.replace("\r\n", "\n")
+    count = content.count(old_n)
     if count == 0:
         return "Error: old_string not found in file (must match exactly, including whitespace)"
     if count > 1 and not args.get("replace_all"):
         return f"Error: old_string appears {count} times; provide more context or set replace_all=true"
-    if args.get("replace_all"):
-        content = content.replace(old, new)
-    else:
-        content = content.replace(old, new, 1)
-    with open(path, "w") as f:
+    content = content.replace(old_n, new_n) if args.get("replace_all") \
+        else content.replace(old_n, new_n, 1)
+    if crlf:
+        content = content.replace("\n", "\r\n")
+    with open(path, "w", newline="") as f:
         f.write(content)
+    _mark_read(path)
     n = count if args.get("replace_all") else 1
     return f"Replaced {n} occurrence(s) in {path}"
 

@@ -47,18 +47,39 @@ DEFAULT_CONFIG = {
 }
 
 
+class ConfigError(Exception):
+    pass
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
 def load_config() -> dict:
-    """Load config, creating the default file on first run."""
+    """Load config, creating the default file on first run.
+
+    User config is deep-merged over defaults, so adding one profile
+    doesn't wipe out the stock ones.
+    """
     os.makedirs(CONFIG_DIR, exist_ok=True)
     if not os.path.exists(CONFIG_PATH):
         with open(CONFIG_PATH, "w") as f:
             json.dump(DEFAULT_CONFIG, f, indent=2)
         return json.loads(json.dumps(DEFAULT_CONFIG))
-    with open(CONFIG_PATH) as f:
-        user_cfg = json.load(f)
-    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
-    cfg.update(user_cfg)
-    return cfg
+    try:
+        with open(CONFIG_PATH) as f:
+            user_cfg = json.load(f)
+    except json.JSONDecodeError as e:
+        raise ConfigError(
+            f"{CONFIG_PATH} is not valid JSON (line {e.lineno}, col {e.colno}): "
+            f"{e.msg}. Fix it or delete the file to regenerate defaults."
+        ) from e
+    return _deep_merge(json.loads(json.dumps(DEFAULT_CONFIG)), user_cfg)
 
 
 def get_profile(cfg: dict, name: str) -> dict:

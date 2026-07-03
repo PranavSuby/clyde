@@ -83,6 +83,7 @@ def _handle_slash(cmd: str, agent: Agent, cfg: dict, state: dict, console: Conso
             console.print(f"Model: [bold]{agent.provider.model}[/bold]")
         else:
             agent.provider.model = arg
+            agent.last_usage = {}
             console.print(f"[dim]Model set to {arg}[/dim]")
             _resolve_ctx(agent.provider, cfg, console)
     elif name == "/profile":
@@ -98,6 +99,7 @@ def _handle_slash(cmd: str, agent: Agent, cfg: dict, state: dict, console: Conso
                 console.print(f"[red]{e}[/red]")
                 return True
             agent.provider = provider
+            agent.last_usage = {}
             state["profile"] = arg
             console.print(f"[dim]Switched to profile '{arg}' (model {provider.model})[/dim]")
     else:
@@ -115,7 +117,11 @@ def main():
     args = parser.parse_args()
 
     console = Console()
-    cfg = config.load_config()
+    try:
+        cfg = config.load_config()
+    except config.ConfigError as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
     profile_name = args.profile or cfg.get("default_profile", "local")
 
     try:
@@ -128,8 +134,14 @@ def main():
 
     # One-shot mode
     if args.prompt:
+        if not args.yolo and not sys.stdin.isatty():
+            console.print(
+                "[red]stdin is not a terminal, so approval prompts can't be "
+                "answered. Re-run with --yolo for non-interactive use.[/red]"
+            )
+            sys.exit(2)
         agent.run_turn(" ".join(args.prompt))
-        return
+        sys.exit(1 if agent.had_error else 0)
 
     console.print(
         f"[bold]clyde[/bold] v{__version__} · profile [cyan]{profile_name}[/cyan] "
@@ -164,6 +176,13 @@ def main():
             agent.run_turn(line)
         except KeyboardInterrupt:
             console.print("\n[yellow]Interrupted.[/yellow]")
+        except Exception as e:  # never lose the session to a bug
+            import traceback
+            traceback.print_exc()
+            console.print(
+                f"[red]Internal error ({type(e).__name__}) — session preserved. "
+                f"Please report the traceback above.[/red]"
+            )
 
     console.print("[dim]bye[/dim]")
 

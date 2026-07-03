@@ -88,7 +88,9 @@ class OllamaProvider(BaseProvider):
         self.num_ctx = num_ctx if isinstance(num_ctx, int) else None
 
     def _is_local(self) -> bool:
-        return "localhost" in self.base_url or "127.0.0.1" in self.base_url
+        from urllib.parse import urlparse
+        host = urlparse(self.base_url).hostname or ""
+        return host in ("localhost", "127.0.0.1", "::1")
 
     def model_details(self) -> dict:
         """Probe the model: max context, KV cache cost/token, weight size."""
@@ -142,6 +144,15 @@ class OllamaProvider(BaseProvider):
             return None, "model default (set num_ctx in config to control it)"
         try:
             det = self.model_details()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                fallback = setting if isinstance(setting, int) else 16384
+                self.num_ctx = fallback
+                return fallback, (f"{fallback} (model '{self.model}' is not "
+                                  f"installed — run: ollama pull {self.model})")
+            fallback = setting if isinstance(setting, int) else 16384
+            self.num_ctx = fallback
+            return fallback, f"{fallback} (model probe failed: {e})"
         except (httpx.HTTPError, ProviderError, ValueError) as e:
             fallback = setting if isinstance(setting, int) else 16384
             self.num_ctx = fallback
@@ -217,7 +228,10 @@ class OllamaProvider(BaseProvider):
                 for line in resp.iter_lines():
                     if not line.strip():
                         continue
-                    chunk = json.loads(line)
+                    try:
+                        chunk = json.loads(line)
+                    except ValueError:
+                        continue  # tolerate malformed/truncated stream lines
                     if chunk.get("error"):
                         raise ProviderError(f"Ollama: {chunk['error']}")
                     msg = chunk.get("message", {})
@@ -265,6 +279,11 @@ class OpenAIProvider(BaseProvider):
 
     type = "openai"
 
+    def __init__(self, base_url, model, api_key=None, context_window=None):
+        super().__init__(base_url, model, api_key)
+        # advisory size for history trimming; cloud models manage their own ctx
+        self.context_window = context_window
+
     def _to_wire(self, messages: list[dict]) -> list[dict]:
         wire = []
         for m in messages:
@@ -293,7 +312,7 @@ class OpenAIProvider(BaseProvider):
                 wire.append({"role": m["role"], "content": m["content"]})
         return wire
 
-    def chat(self, messages, tools):
+    def chat(self, messages, tools, _with_usage=True):
         payload = {
             "model": self.model,
             "messages": self._to_wire(messages),
@@ -301,6 +320,8 @@ class OpenAIProvider(BaseProvider):
         }
         if tools:
             payload["tools"] = tools
+        if _with_usage:
+            payload["stream_options"] = {"include_usage": True}
 
         # index -> partial tool call
         partial: dict[int, dict] = {}
@@ -311,6 +332,11 @@ class OpenAIProvider(BaseProvider):
                 "POST", f"{self.base_url}/chat/completions",
                 json=payload, headers=self._headers(),
             ) as resp:
+                if resp.status_code == 400 and _with_usage:
+                    # some providers reject stream_options; retry without it
+                    resp.read()
+                    yield from self.chat(messages, tools, _with_usage=False)
+                    return
                 if resp.status_code != 200:
                     body = resp.read().decode(errors="replace")
                     raise ProviderError(f"HTTP {resp.status_code}: {body[:500]}")
@@ -321,7 +347,10 @@ class OpenAIProvider(BaseProvider):
                     data = line[5:].strip()
                     if data == "[DONE]":
                         break
-                    chunk = json.loads(data)
+                    try:
+                        chunk = json.loads(data)
+                    except ValueError:
+                        continue  # tolerate malformed/truncated stream lines
                     if chunk.get("usage"):
                         usage = {
                             "prompt_tokens": chunk["usage"].get("prompt_tokens", 0),
@@ -397,19 +426,26 @@ def make_provider(profile: dict, model_override: str | None = None) -> BaseProvi
             num_ctx=profile.get("num_ctx"),
         )
     if ptype == "openai":
-        return OpenAIProvider(profile["base_url"], model, api_key=api_key)
+        return OpenAIProvider(profile["base_url"], model, api_key=api_key,
+                              context_window=profile.get("context_window"))
     raise ProviderError(f"Unknown provider type '{ptype}'")
 
 
 def ensure_ollama_running(base_url: str, auto_start: bool = True) -> bool:
     """If the profile points at a local Ollama, start the daemon if needed."""
-    if "localhost" not in base_url and "127.0.0.1" not in base_url:
+    from urllib.parse import urlparse
+    if (urlparse(base_url).hostname or "") not in ("localhost", "127.0.0.1", "::1"):
         return True
-    try:
-        httpx.get(base_url, timeout=2.0)
+
+    def _is_ollama() -> bool:
+        try:
+            resp = httpx.get(base_url, timeout=2.0)
+            return resp.status_code == 200 and "ollama" in resp.text.lower()
+        except httpx.HTTPError:
+            return False
+
+    if _is_ollama():
         return True
-    except httpx.HTTPError:
-        pass
     if not auto_start:
         return False
     ollama_bin = shutil.which("ollama")
@@ -423,9 +459,6 @@ def ensure_ollama_running(base_url: str, auto_start: bool = True) -> bool:
     )
     for _ in range(30):
         time.sleep(0.5)
-        try:
-            httpx.get(base_url, timeout=2.0)
+        if _is_ollama():
             return True
-        except httpx.HTTPError:
-            continue
     return False
