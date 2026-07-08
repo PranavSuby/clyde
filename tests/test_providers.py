@@ -3,7 +3,7 @@ import json
 import httpx
 import pytest
 
-from clyde.providers import OpenAIProvider, ProviderError
+from clyde.providers import ContextOverflowError, OpenAIProvider, ProviderError
 
 
 def sse(lines):
@@ -71,6 +71,36 @@ def test_http_error_raises_provider_error():
     p = make_provider(lambda req: httpx.Response(500, text="boom"))
     with pytest.raises(ProviderError):
         list(p.chat([{"role": "user", "content": "x"}], []))
+
+
+def test_rate_limit_is_retryable():
+    p = make_provider(lambda req: httpx.Response(429, text="slow down"))
+    with pytest.raises(ProviderError) as ei:
+        list(p.chat([{"role": "user", "content": "x"}], []))
+    assert ei.value.retryable
+
+
+def test_auth_error_is_not_retryable():
+    p = make_provider(lambda req: httpx.Response(401, text="bad key"))
+    with pytest.raises(ProviderError) as ei:
+        list(p.chat([{"role": "user", "content": "x"}], []))
+    assert not ei.value.retryable
+
+
+def test_context_overflow_typed():
+    p = make_provider(lambda req: httpx.Response(
+        400, text="This model's maximum context length is 8192 tokens"))
+    with pytest.raises(ContextOverflowError):
+        list(p.chat([{"role": "user", "content": "x"}], []))
+
+
+def test_connection_error_is_retryable():
+    def handler(req):
+        raise httpx.ConnectError("refused")
+    p = make_provider(handler)
+    with pytest.raises(ProviderError) as ei:
+        list(p.chat([{"role": "user", "content": "x"}], []))
+    assert ei.value.retryable
 
 
 def test_ollama_wire_helpers():

@@ -5,6 +5,7 @@ from rich.console import Console
 
 from clyde import config, session
 from clyde.agent import Agent
+from clyde.providers import ContextOverflowError, ProviderError
 
 
 class FakeProvider:
@@ -14,6 +15,29 @@ class FakeProvider:
 
 def make_agent(cfg=None):
     return Agent(FakeProvider(), Console(file=open(os.devnull, "w")), cfg or {})
+
+
+class ScriptedProvider:
+    """Yields one pre-scripted event list (or raises) per chat() call."""
+
+    model = "fake"
+    num_ctx = 32768
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = []  # deep copy of the messages each call saw
+
+    def chat(self, messages, tools):
+        self.calls.append(json.loads(json.dumps(messages)))
+        step = self.script.pop(0)
+        if isinstance(step, Exception):
+            raise step
+        yield from step
+
+
+def scripted_agent(script, cfg=None, yolo=True):
+    return Agent(ScriptedProvider(script), Console(file=open(os.devnull, "w")),
+                 cfg or {}, yolo=yolo)
 
 
 def test_trim_preserves_tool_pairing():
@@ -50,7 +74,82 @@ def test_rule_matches():
 
 def test_allow_rule_skips_prompt():
     a = make_agent({"permissions": {"allow": ["bash(git *)"]}})
-    assert a._approve("bash", {"command": "git log"}) is True
+    assert a.approval.approve("bash", {"command": "git log"}) is True
+
+
+def test_run_turn_plain_answer():
+    a = scripted_agent([
+        [("text", "hello there"), ("usage", {"prompt_tokens": 1})],
+    ])
+    a.run_turn("hi")
+    assert a.messages[-1] == {"role": "assistant", "content": "hello there"}
+    assert not a.had_error
+
+
+def test_run_turn_tool_roundtrip():
+    tc = {"id": "t1", "name": "bash", "arguments": {"command": "echo roundtrip"}}
+    a = scripted_agent([
+        [("tool_calls", [tc]), ("usage", {})],
+        [("text", "done"), ("usage", {})],
+    ])
+    a.run_turn("run it")
+    tool_msg = next(m for m in a.messages if m["role"] == "tool")
+    assert tool_msg["tool_call_id"] == "t1"
+    assert "roundtrip" in tool_msg["content"]
+    assert a.messages[-1]["content"] == "done"
+    # the second model call must have seen the tool result
+    assert any(m["role"] == "tool" for m in a.provider.calls[1])
+
+
+def test_run_turn_denied_tool_records_error():
+    tc = {"id": "t1", "name": "bash", "arguments": {"command": "echo hi"}}
+    a = scripted_agent([
+        [("tool_calls", [tc]), ("usage", {})],
+        [("text", "ok"), ("usage", {})],
+    ], yolo=False)
+    a.approval.approve = lambda name, args, preview=None: False
+    a.run_turn("run")
+    tool_msg = next(m for m in a.messages if m["role"] == "tool")
+    assert tool_msg["content"].startswith("Error: user denied")
+    assert a.messages[-1]["content"] == "ok"
+
+
+def test_run_turn_retries_transient_error(monkeypatch):
+    from clyde import agent as agent_mod
+    monkeypatch.setattr(agent_mod.time, "sleep", lambda s: None)
+    a = scripted_agent([
+        ProviderError("HTTP 503: overloaded", retryable=True),
+        [("text", "recovered"), ("usage", {})],
+    ])
+    a.run_turn("hi")
+    assert not a.had_error
+    assert a.messages[-1]["content"] == "recovered"
+
+
+def test_run_turn_nonretryable_error_stops():
+    a = scripted_agent([ProviderError("HTTP 401: bad key")])
+    a.run_turn("hi")
+    assert a.had_error
+
+
+def test_run_turn_overflow_compacts_and_retries():
+    a = scripted_agent([
+        ContextOverflowError("maximum context length exceeded"),
+        [("text", "a compact summary")],          # the compact() call
+        [("text", "final answer"), ("usage", {})],
+    ])
+    a.messages += [
+        {"role": "user", "content": "earlier question"},
+        {"role": "assistant", "content": "earlier answer"},
+    ]
+    a.run_turn("the question")
+    assert len(a.provider.calls) == 3
+    assert any("Summary of the conversation so far" in str(m.get("content"))
+               for m in a.messages)
+    # the original question survives the compaction verbatim
+    assert any(m.get("content") == "the question" for m in a.messages)
+    assert a.messages[-1]["content"] == "final answer"
+    assert not a.had_error
 
 
 def test_session_roundtrip(tmp_path, monkeypatch):
@@ -66,7 +165,7 @@ def test_session_roundtrip(tmp_path, monkeypatch):
 
 
 def test_config_deep_merge_keeps_defaults():
-    merged = config._deep_merge(
+    merged = config.deep_merge(
         json.loads(json.dumps(config.DEFAULT_CONFIG)),
         {"profiles": {"mine": {"type": "openai"}}},
     )

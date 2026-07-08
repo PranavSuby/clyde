@@ -65,13 +65,23 @@ class ConfigError(Exception):
     pass
 
 
-def _deep_merge(base: dict, override: dict) -> dict:
+def deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge override into base (in place). Public: also used
+    by clydesk, which shares this config machinery."""
     for key, value in override.items():
         if isinstance(value, dict) and isinstance(base.get(key), dict):
-            _deep_merge(base[key], value)
+            deep_merge(base[key], value)
         else:
             base[key] = value
     return base
+
+
+def atomic_write_json(path: str, data: dict):
+    """Write JSON via a temp file + rename, so a crash can't truncate it."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
 
 
 def load_config() -> dict:
@@ -93,15 +103,12 @@ def load_config() -> dict:
             f"{CONFIG_PATH} is not valid JSON (line {e.lineno}, col {e.colno}): "
             f"{e.msg}. Fix it or delete the file to regenerate defaults."
         ) from e
-    return _deep_merge(json.loads(json.dumps(DEFAULT_CONFIG)), user_cfg)
+    return deep_merge(json.loads(json.dumps(DEFAULT_CONFIG)), user_cfg)
 
 
 def save_config(cfg: dict):
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    tmp = CONFIG_PATH + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(cfg, f, indent=2)
-    os.replace(tmp, CONFIG_PATH)
+    atomic_write_json(CONFIG_PATH, cfg)
 
 
 def rule_matches(rule: str, name: str, args: dict) -> bool:

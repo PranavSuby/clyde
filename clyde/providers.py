@@ -24,7 +24,32 @@ from .ollama_wire import is_local_url, new_call_id, parse_tool_calls, parse_usag
 
 
 class ProviderError(Exception):
-    pass
+    """A backend request failed. `retryable` marks transient faults
+    (rate limits, 5xx, unreachable host) worth an automatic retry."""
+
+    def __init__(self, message: str, *, retryable: bool = False):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+class ContextOverflowError(ProviderError):
+    """The prompt exceeded the model's context window."""
+
+
+# The wire gives no typed signal for these; classify the error text once,
+# here at the boundary, so callers can dispatch on the exception type.
+_OVERFLOW_MARKERS = ("context length", "context_length", "too long",
+                     "maximum context", "context window")
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+
+def _classify_error(message: str, status: int | None = None) -> ProviderError:
+    low = message.lower()
+    if any(m in low for m in _OVERFLOW_MARKERS):
+        return ContextOverflowError(message)
+    retryable = status in _RETRYABLE_STATUS \
+        or "overloaded" in low or "timed out" in low
+    return ProviderError(message, retryable=retryable)
 
 
 def _gpu_vram_bytes() -> int:
@@ -219,7 +244,9 @@ class OllamaProvider(BaseProvider):
             ) as resp:
                 if resp.status_code != 200:
                     body = resp.read().decode(errors="replace")
-                    raise ProviderError(f"Ollama HTTP {resp.status_code}: {body[:500]}")
+                    raise _classify_error(
+                        f"Ollama HTTP {resp.status_code}: {body[:500]}",
+                        resp.status_code)
                 for line in resp.iter_lines():
                     if not line.strip():
                         continue
@@ -228,7 +255,7 @@ class OllamaProvider(BaseProvider):
                     except ValueError:
                         continue  # tolerate malformed/truncated stream lines
                     if chunk.get("error"):
-                        raise ProviderError(f"Ollama: {chunk['error']}")
+                        raise _classify_error(f"Ollama: {chunk['error']}")
                     msg = chunk.get("message", {})
                     if msg.get("thinking"):
                         yield ("thinking", msg["thinking"])
@@ -238,7 +265,8 @@ class OllamaProvider(BaseProvider):
                     if chunk.get("done"):
                         usage = parse_usage(chunk)
         except httpx.HTTPError as e:
-            raise ProviderError(f"Cannot reach Ollama at {self.base_url}: {e}") from e
+            raise ProviderError(f"Cannot reach Ollama at {self.base_url}: {e}",
+                                retryable=True) from e
 
         if tool_calls:
             yield ("tool_calls", tool_calls)
@@ -319,7 +347,9 @@ class OpenAIProvider(BaseProvider):
                     return
                 if resp.status_code != 200:
                     body = resp.read().decode(errors="replace")
-                    raise ProviderError(f"HTTP {resp.status_code}: {body[:500]}")
+                    raise _classify_error(
+                        f"HTTP {resp.status_code}: {body[:500]}",
+                        resp.status_code)
                 for line in resp.iter_lines():
                     line = line.strip()
                     if not line.startswith("data:"):
@@ -358,7 +388,8 @@ class OpenAIProvider(BaseProvider):
                         if fn.get("arguments"):
                             slot["arguments"] += fn["arguments"]
         except httpx.HTTPError as e:
-            raise ProviderError(f"Cannot reach {self.base_url}: {e}") from e
+            raise ProviderError(f"Cannot reach {self.base_url}: {e}",
+                                retryable=True) from e
 
         if partial:
             tool_calls = []

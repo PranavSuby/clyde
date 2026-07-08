@@ -114,7 +114,13 @@ def uses_cheat(code: str) -> str | None:
     return None
 
 
-def run(args: dict) -> str:
+def run(args: dict, conf: dict | None = None) -> str:
+    """Check the proof in ``args["code"]``.
+
+    ``conf`` overrides the ``lean`` config section (keys: enabled,
+    project_dir, elan_bin, timeout) — used by other frontends (clydesk)
+    that keep their own config; defaults to this app's config.
+    """
     import re
     import signal
     import subprocess
@@ -132,7 +138,8 @@ def run(args: dict) -> str:
                     "lean_check verifies proofs, it does not run I/O or "
                     "external code. Remove it and prove the statement instead.")
 
-    conf = lean_conf()
+    if conf is None:
+        conf = lean_conf()
     if not conf.get("enabled", True):
         return "Error: Lean proof checking is disabled in the config (lean.enabled)."
 

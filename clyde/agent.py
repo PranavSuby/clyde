@@ -13,10 +13,10 @@ from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
 
-from . import config as config_mod
+from .approval import ApprovalPolicy
 from .streaming import ThinkFilter  # noqa: F401 — re-exported
 from . import tools
-from .providers import BaseProvider, ProviderError
+from .providers import BaseProvider, ContextOverflowError, ProviderError
 
 CONTEXT_FILES = ("CLYDE.md", "AGENTS.md", "CLAUDE.md")
 
@@ -219,10 +219,9 @@ class Agent:
         self.provider = provider
         self.console = console
         self.cfg = cfg
-        self.yolo = yolo
+        self.approval = ApprovalPolicy(cfg, console, yolo)
         self.cwd = os.getcwd()
         self.last_usage: dict = {}
-        self.session_allow: set[str] = set()
         self.had_error = False
         self.checkpoints: list[tuple[str, str | None]] = []
         self.mcp_servers: dict = {}  # populated by the CLI from config
@@ -230,6 +229,14 @@ class Agent:
         self.messages: list[dict] = [
             {"role": "system", "content": build_system_prompt(self.cwd)}
         ]
+
+    @property
+    def yolo(self) -> bool:
+        return self.approval.yolo
+
+    @yolo.setter
+    def yolo(self, value: bool):
+        self.approval.yolo = value
 
     def clear(self):
         self.messages = [
@@ -339,61 +346,27 @@ class Agent:
                 styled.append(e)
         return "\n".join(styled)
 
-    def _rule_for(self, name: str, args: dict) -> str:
-        """The allow-rule suggestion for the 'p' (persist) approval answer."""
-        if name == "bash":
-            first = (args.get("command", "").strip().split() or ["?"])[0]
-            return f"bash({first} *)"
-        return name
-
-    def _approve(self, name: str, args: dict) -> bool:
-        needs_approval = name in tools.APPROVAL_REQUIRED \
-            or name.startswith("mcp__")  # MCP tools may have side effects
-        if self.yolo or name in self.session_allow or not needs_approval:
-            return True
-        for rule in self.cfg.get("permissions", {}).get("allow", []):
-            if config_mod.rule_matches(rule, name, args):
-                return True
-        if name in ("edit_file", "write_file"):
-            diff = self._diff_preview(args, is_edit=(name == "edit_file"))
-            if diff is not None:
-                self.console.print(Panel(
-                    diff, title=f"{name.split('_')[0]} {args.get('path', '')}",
-                    border_style="yellow"))
-            elif name == "edit_file":
-                body = (
-                    f"[red]- {escape(self._clip(args.get('old_string', ''), 1500))}[/red]\n"
-                    f"[green]+ {escape(self._clip(args.get('new_string', ''), 1500))}[/green]"
-                )
-                self.console.print(Panel(body, title=f"edit {args.get('path', '')}",
-                                         border_style="yellow"))
-            else:
-                preview = escape(self._clip(args.get("content", ""), 2000))
-                self.console.print(Panel(
-                    preview, title=f"write new file {args.get('path', '')}",
-                    border_style="yellow"))
-        persist_rule = self._rule_for(name, args)
-        try:
-            answer = self.console.input(
-                f"[yellow]Allow {name}? \\[y/n/a=always allow {name} this session"
-                f"/p=permanently allow {escape(persist_rule)}][/yellow] "
-            ).strip().lower()
-        except EOFError:
-            return False
-        if answer == "a":
-            self.session_allow.add(name)
-            self.console.print(f"[dim]{name} auto-approved for this session "
-                               f"(/yolo for everything)[/dim]")
-            return True
-        if answer == "p":
-            allow = self.cfg.setdefault("permissions", {}).setdefault("allow", [])
-            if persist_rule not in allow:
-                allow.append(persist_rule)
-                config_mod.save_config(self.cfg)
-            self.console.print(f"[dim]saved allow rule: {escape(persist_rule)} "
-                               f"({config_mod.CONFIG_PATH})[/dim]")
-            return True
-        return answer in ("y", "yes")
+    def _render_change_preview(self, name: str, args: dict):
+        """Show what an edit/write would change, before the approval prompt."""
+        if name not in ("edit_file", "write_file"):
+            return
+        diff = self._diff_preview(args, is_edit=(name == "edit_file"))
+        if diff is not None:
+            self.console.print(Panel(
+                diff, title=f"{name.split('_')[0]} {args.get('path', '')}",
+                border_style="yellow"))
+        elif name == "edit_file":
+            body = (
+                f"[red]- {escape(self._clip(args.get('old_string', ''), 1500))}[/red]\n"
+                f"[green]+ {escape(self._clip(args.get('new_string', ''), 1500))}[/green]"
+            )
+            self.console.print(Panel(body, title=f"edit {args.get('path', '')}",
+                                     border_style="yellow"))
+        else:
+            preview = escape(self._clip(args.get("content", ""), 2000))
+            self.console.print(Panel(
+                preview, title=f"write new file {args.get('path', '')}",
+                border_style="yellow"))
 
     # ------------------------------------------------------------------
     # Main loop
@@ -412,20 +385,6 @@ class Agent:
                 f"auto-compacting...[/yellow]"
             )
             self.compact()
-
-    @staticmethod
-    def _is_retryable(err: Exception) -> bool:
-        s = str(err)
-        return any(marker in s for marker in
-                   ("429", "500", "502", "503", "504", "Cannot reach",
-                    "overloaded", "timed out"))
-
-    @staticmethod
-    def _is_context_overflow(err: Exception) -> bool:
-        s = str(err).lower()
-        return any(marker in s for marker in
-                   ("context length", "context_length", "too long",
-                    "maximum context", "context window"))
 
     def _run_turn(self, user_input: str):
         self.messages.append({"role": "user", "content": user_input})
@@ -461,7 +420,7 @@ class Agent:
             except ProviderError as e:
                 self._end_stream(state)
                 nothing_streamed = not text_parts and not tool_calls
-                if nothing_streamed and self._is_context_overflow(e) \
+                if nothing_streamed and isinstance(e, ContextOverflowError) \
                         and not compacted_already and len(self.messages) > 3 \
                         and self.messages[-1]["role"] == "user":
                     compacted_already = True
@@ -471,7 +430,7 @@ class Agent:
                     self.compact()
                     self.messages.append(pending)
                     continue
-                if nothing_streamed and retries_left > 0 and self._is_retryable(e):
+                if nothing_streamed and retries_left > 0 and e.retryable:
                     retries_left -= 1
                     delay = 2 ** (2 - retries_left)
                     self.console.print(f"[yellow]Transient provider error, "
@@ -678,16 +637,10 @@ class Agent:
                                    markup=False, highlight=False)
 
         outside = tools.outside_workspace(name, args)
-        approved = self._approve(name, args)
-        if approved and outside and not self.yolo:
-            try:
-                answer = self.console.input(
-                    f"[yellow]Reads outside the workspace "
-                    f"({escape(outside)}) — allow? \\[y/n][/yellow] "
-                ).strip().lower()
-            except EOFError:
-                answer = "n"
-            approved = answer in ("y", "yes")
+        approved = self.approval.approve(
+            name, args, preview=lambda: self._render_change_preview(name, args))
+        if approved and outside:
+            approved = self.approval.confirm_outside_read(outside)
 
         if not approved:
             result = "Error: user denied this tool call. Ask before retrying."
