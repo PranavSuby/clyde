@@ -19,8 +19,9 @@ from prompt_toolkit.history import FileHistory
 from rich.console import Console
 from rich.markup import escape
 
-from . import __version__, config, session as session_mod, tools
-from .agent import Agent
+from . import __version__, config, tools
+from . import session as session_mod
+from .agent import Agent, build_system_prompt
 from .providers import ProviderError, ensure_ollama_running, make_provider
 
 _MENTION_RE = re.compile(r"@([~\w./\\-]+)")
@@ -91,6 +92,54 @@ def _resolve_ctx(provider, cfg, console):
         console.print(f"[dim]num_ctx: {note}[/dim]")
 
 
+def _apply_resumed_session(agent, data, cfg, state, console,
+                           explicit_profile=False, explicit_model=False):
+    """Load a saved session into `agent`: restore the transcript, refresh the
+    system prompt for the *current* cwd, warn on a cwd mismatch, and restore
+    the session's saved profile/model unless overridden on the CLI."""
+    agent.messages = data["messages"]
+    # tools resolve paths against the current cwd, so the system prompt must
+    # describe the current cwd — not the (stale) one saved in the transcript
+    fresh = {"role": "system", "content": build_system_prompt(agent.cwd)}
+    if agent.messages and agent.messages[0].get("role") == "system":
+        agent.messages[0] = fresh
+    else:
+        agent.messages.insert(0, fresh)
+
+    saved_cwd = data.get("cwd")
+    if saved_cwd and saved_cwd != agent.cwd:
+        console.print(
+            f"[yellow]Note: this session was started in {saved_cwd}; you're "
+            f"now in {agent.cwd}. Tools act on the current directory.[/yellow]"
+        )
+
+    if explicit_profile:
+        return  # user picked a profile on the CLI; honor it over the saved one
+    saved_profile = data.get("profile")
+    saved_model = data.get("model")
+    if saved_profile and saved_profile != state["profile"] \
+            and saved_profile in cfg.get("profiles", {}):
+        try:
+            provider, _ = _setup_provider(
+                cfg, saved_profile,
+                None if explicit_model else saved_model, console)
+        except (KeyError, ProviderError) as e:
+            console.print(f"[yellow]Could not restore saved profile "
+                          f"'{saved_profile}' ({e}); keeping "
+                          f"'{state['profile']}'.[/yellow]")
+        else:
+            agent.provider = provider
+            agent.last_usage = {}
+            state["profile"] = saved_profile
+            console.print(f"[dim]Restored profile '{saved_profile}' "
+                          f"(model {provider.model}).[/dim]")
+    elif not explicit_model and saved_model \
+            and saved_model != agent.provider.model:
+        agent.provider.model = saved_model
+        agent.last_usage = {}
+        console.print(f"[dim]Restored model '{saved_model}'.[/dim]")
+
+
 def _handle_slash(cmd: str, agent: Agent, cfg: dict, state: dict, console: Console) -> bool:
     """Handle a slash command. Returns False if the REPL should exit."""
     parts = cmd.split(maxsplit=1)
@@ -139,13 +188,23 @@ def _handle_slash(cmd: str, agent: Agent, cfg: dict, state: dict, console: Conso
             )
         try:
             pick = console.input("[yellow]Resume which? (number/blank)[/yellow] ").strip()
-        except EOFError:
+        except (EOFError, KeyboardInterrupt):
+            console.print()
             return True
         if pick.isdigit() and 1 <= int(pick) <= len(sessions):
             chosen = sessions[int(pick) - 1]
-            data = session_mod.load(chosen["path"])
-            agent.messages = data["messages"]
-            state["session_path"] = chosen["path"]
+            try:
+                data = session_mod.load(chosen["path"])
+            except (OSError, ValueError) as e:
+                console.print(f"[red]Cannot resume: {e}[/red]")
+                return True
+            session_mod.release(state["session_path"])
+            claimed = session_mod.claim(chosen["path"])
+            if claimed != chosen["path"]:
+                console.print("[yellow]Another clyde is using that session; "
+                              "continuing in a new one.[/yellow]")
+            state["session_path"] = claimed
+            _apply_resumed_session(agent, data, cfg, state, console)
             console.print(f"[dim]Resumed {chosen['path']} "
                           f"({chosen['turns']} turns).[/dim]")
     elif name == "/model":
@@ -207,15 +266,29 @@ def main():
         from . import mcp
         agent.mcp_servers = mcp.load_servers(cfg, console)
 
-    session_path = session_mod.new_session_path()
+    state = {"profile": profile_name,
+             "session_path": session_mod.new_session_path()}
+
     if args.cont:
         recent = session_mod.list_sessions(cwd=os.getcwd(), limit=1)
         if recent:
-            data = session_mod.load(recent[0]["path"])
-            agent.messages = data["messages"]
-            session_path = recent[0]["path"]
-            console.print(f"[dim]Continuing session with "
-                          f"{recent[0]['turns']} prior turns.[/dim]")
+            try:
+                data = session_mod.load(recent[0]["path"])
+            except (OSError, ValueError) as e:
+                console.print(f"[dim]Could not load previous session ({e}); "
+                              f"starting fresh.[/dim]")
+            else:
+                claimed = session_mod.claim(recent[0]["path"])
+                if claimed != recent[0]["path"]:
+                    console.print("[yellow]Another clyde is using that session; "
+                                  "continuing in a new one.[/yellow]")
+                state["session_path"] = claimed
+                _apply_resumed_session(
+                    agent, data, cfg, state, console,
+                    explicit_profile=args.profile is not None,
+                    explicit_model=args.model is not None)
+                console.print(f"[dim]Continuing session with "
+                              f"{recent[0]['turns']} prior turns.[/dim]")
         else:
             console.print("[dim]No previous session here; starting fresh.[/dim]")
 
@@ -224,8 +297,6 @@ def main():
             session_mod.save(state["session_path"], agent, state["profile"])
         except OSError as e:
             console.print(f"[dim]session save failed: {e}[/dim]")
-
-    state = {"profile": profile_name, "session_path": session_path}
 
     def close_mcp():
         for server in agent.mcp_servers.values():
@@ -244,11 +315,12 @@ def main():
         finally:
             save_session()
             close_mcp()
+            session_mod.release(state["session_path"])
         sys.exit(1 if agent.had_error else 0)
 
     console.print(
-        f"[bold]clyde[/bold] v{__version__} · profile [cyan]{profile_name}[/cyan] "
-        f"· model [cyan]{provider.model}[/cyan]\n"
+        f"[bold]clyde[/bold] v{__version__} · profile [cyan]{state['profile']}[/cyan] "
+        f"· model [cyan]{agent.provider.model}[/cyan]\n"
         f"[dim]/help for commands · config: {config.CONFIG_PATH}[/dim]"
     )
 
@@ -265,6 +337,7 @@ def main():
         _repl_loop(session, agent, cfg, state, console, rprompt, save_session)
     finally:
         close_mcp()
+        session_mod.release(state["session_path"])
     console.print("[dim]bye[/dim]")
 
 
@@ -278,13 +351,12 @@ def _repl_loop(session, agent, cfg, state, console, rprompt, save_session):
             break
         if not line:
             continue
-        if line.startswith("/"):
-            if not _handle_slash(line, agent, cfg, state, console):
-                break
-            save_session()
-            continue
         try:
-            agent.run_turn(expand_mentions(line, console))
+            if line.startswith("/"):
+                if not _handle_slash(line, agent, cfg, state, console):
+                    break
+            else:
+                agent.run_turn(expand_mentions(line, console))
         except KeyboardInterrupt:
             console.print("\n[yellow]Interrupted.[/yellow]")
         except Exception as e:  # never lose the session to a bug

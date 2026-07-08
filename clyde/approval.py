@@ -17,6 +17,8 @@ class ApprovalPolicy:
         self.cfg = cfg
         self.console = console
         self.yolo = yolo
+        # session-scoped allow rules ("bash(git *)", "edit_file"), matched
+        # with the same semantics as persisted permission rules
         self.session_allow: set[str] = set()
 
     @staticmethod
@@ -35,32 +37,36 @@ class ApprovalPolicy:
         """
         needs_approval = name in tools.APPROVAL_REQUIRED \
             or name.startswith("mcp__")  # MCP tools may have side effects
-        if self.yolo or name in self.session_allow or not needs_approval:
+        if self.yolo or not needs_approval:
             return True
+        for rule in self.session_allow:
+            if config_mod.rule_matches(rule, name, args):
+                return True
         for rule in self.cfg.get("permissions", {}).get("allow", []):
             if config_mod.rule_matches(rule, name, args):
                 return True
         if preview is not None:
             preview()
-        persist_rule = self.rule_for(name, args)
+        rule = self.rule_for(name, args)
         try:
             answer = self.console.input(
-                f"[yellow]Allow {name}? \\[y/n/a=always allow {name} this session"
-                f"/p=permanently allow {escape(persist_rule)}][/yellow] "
+                f"[yellow]Allow {escape(name)}? \\[y/n/a=allow "
+                f"{escape(rule)} this session"
+                f"/p=permanently allow {escape(rule)}][/yellow] "
             ).strip().lower()
         except EOFError:
             return False
         if answer == "a":
-            self.session_allow.add(name)
-            self.console.print(f"[dim]{name} auto-approved for this session "
-                               f"(/yolo for everything)[/dim]")
+            self.session_allow.add(rule)
+            self.console.print(f"[dim]{escape(rule)} auto-approved for this "
+                               f"session (/yolo for everything)[/dim]")
             return True
         if answer == "p":
             allow = self.cfg.setdefault("permissions", {}).setdefault("allow", [])
-            if persist_rule not in allow:
-                allow.append(persist_rule)
-                config_mod.save_config(self.cfg)
-            self.console.print(f"[dim]saved allow rule: {escape(persist_rule)} "
+            if rule not in allow:
+                allow.append(rule)
+            config_mod.add_allow_rule(rule)
+            self.console.print(f"[dim]saved allow rule: {escape(rule)} "
                                f"({config_mod.CONFIG_PATH})[/dim]")
             return True
         return answer in ("y", "yes")

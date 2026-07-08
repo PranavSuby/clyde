@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 
 CONFIG_DIR = os.path.expanduser("~/.config/clyde")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
@@ -111,6 +112,26 @@ def save_config(cfg: dict):
     atomic_write_json(CONFIG_PATH, cfg)
 
 
+def add_allow_rule(rule: str):
+    """Persist an allow rule into the on-disk user config only, so the
+    merged defaults never get frozen into the user's file."""
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    try:
+        with open(CONFIG_PATH) as f:
+            user_cfg = json.load(f)
+    except (OSError, ValueError):
+        user_cfg = {}
+    allow = user_cfg.setdefault("permissions", {}).setdefault("allow", [])
+    if rule not in allow:
+        allow.append(rule)
+        atomic_write_json(CONFIG_PATH, user_cfg)
+
+
+# Shell constructs that let a command escape a "bash(git *)" prefix rule:
+# chaining, pipes, substitution, redirection (files, fds, /dev/tcp), newlines.
+_BASH_UNSAFE = re.compile(r"[;&|`\n<>]|\$\(")
+
+
 def rule_matches(rule: str, name: str, args: dict) -> bool:
     """Permission rule check: "edit_file" or "bash(git *)" (prefix)."""
     if "(" not in rule:
@@ -119,11 +140,27 @@ def rule_matches(rule: str, name: str, args: dict) -> bool:
     pattern = pattern.rstrip(")")
     if rule_tool != name:
         return False
-    target = args.get("command", "").strip() if name == "bash" \
-        else str(args.get("path", ""))
+    if name == "bash":
+        target = args.get("command", "").strip()
+        if pattern.endswith("*"):
+            # a prefix rule must not approve `git status; rm -rf ~` etc.
+            return not _BASH_UNSAFE.search(target) \
+                and target.startswith(pattern[:-1])
+        return target == pattern
+    # path rules match the resolved real path, so `src/../../etc/passwd`
+    # cannot satisfy `edit_file(src/*)`
+    from . import tools
+    target = os.path.realpath(tools._resolve(str(args.get("path", ""))))
     if pattern.endswith("*"):
-        return target.startswith(pattern[:-1])
-    return target == pattern
+        prefix = os.path.realpath(tools._resolve(pattern[:-1] or "."))
+        base = pattern[:-1]
+        # `src/*` means "inside src/": realpath of "src/" keeps no trailing
+        # sep, so match either the dir itself-prefixed children or the
+        # literal filename prefix (`src/foo*`)
+        if base.endswith(os.sep) or base.endswith("/"):
+            return target == prefix or target.startswith(prefix + os.sep)
+        return target.startswith(prefix)
+    return target == os.path.realpath(tools._resolve(pattern))
 
 
 def get_profile(cfg: dict, name: str) -> dict:

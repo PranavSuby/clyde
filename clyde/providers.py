@@ -398,7 +398,10 @@ class OpenAIProvider(BaseProvider):
                 try:
                     args = json.loads(slot["arguments"]) if slot["arguments"] else {}
                 except json.JSONDecodeError:
-                    args = {}
+                    # let the tool layer report the parse failure to the model
+                    args = {"_malformed_json": slot["arguments"]}
+                if not isinstance(args, dict):
+                    args = {"_malformed_json": slot["arguments"]}
                 tool_calls.append({
                     "id": slot["id"] or new_call_id(),
                     "name": slot["name"],

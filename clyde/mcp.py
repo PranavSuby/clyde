@@ -75,17 +75,25 @@ class MCPServer:
 
     def _notify(self, method: str):
         note = {"jsonrpc": "2.0", "method": method}
-        self.proc.stdin.write(json.dumps(note) + "\n")
-        self.proc.stdin.flush()
+        try:
+            self.proc.stdin.write(json.dumps(note) + "\n")
+            self.proc.stdin.flush()
+        except (OSError, ValueError) as e:
+            raise MCPError(f"{self.name}: server pipe closed: {e}") from e
 
     def _handshake(self) -> list[dict]:
-        self._request("initialize", {
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {},
-            "clientInfo": {"name": "clyde", "version": "0.2"},
-        })
-        self._notify("notifications/initialized")
-        result = self._request("tools/list")
+        # a dead server must not stall startup for the full call timeout
+        call_timeout, self.timeout = self.timeout, min(self.timeout, 10.0)
+        try:
+            self._request("initialize", {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "clyde", "version": "0.2"},
+            })
+            self._notify("notifications/initialized")
+            result = self._request("tools/list")
+        finally:
+            self.timeout = call_timeout
         return result.get("tools", [])
 
     def call(self, tool: str, args: dict) -> str:
@@ -102,10 +110,27 @@ class MCPServer:
         return text
 
     def close(self):
+        import os
+        import signal
+        if self.proc.poll() is not None:
+            return
+        # the server may have spawned children (npx -> node): signal the
+        # whole process group, and reap so no zombie lingers
         try:
-            self.proc.terminate()
+            os.killpg(self.proc.pid, signal.SIGTERM)
         except OSError:
             pass
+        try:
+            self.proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                self.proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
 
 
 def load_servers(cfg: dict, console=None) -> dict[str, MCPServer]:
@@ -118,7 +143,7 @@ def load_servers(cfg: dict, console=None) -> dict[str, MCPServer]:
             if console:
                 console.print(f"[dim]mcp: {name} up "
                               f"({len(servers[name].tools)} tools)[/dim]")
-        except (MCPError, KeyError) as e:
+        except (MCPError, KeyError, OSError) as e:
             if console:
                 console.print(f"[red]mcp: {name} failed: {e}[/red]")
     return servers

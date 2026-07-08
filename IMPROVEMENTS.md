@@ -3,6 +3,66 @@
 From a deep code review (independent reviewer pass, 2026-07-02) plus a gap
 analysis against Claude Code. Ordered so each phase is shippable on its own.
 
+**Status (2026-07-08):** Phases 0–2 are implemented and shipped. A second
+review pass found a set of trust-boundary and robustness regressions, all
+fixed in Phase 3 below.
+
+## Phase 3 — Security & robustness hardening (2026-07-08) — DONE
+
+1. **Allow-rule shell-chaining bypass (critical).** A persisted
+   `bash(git *)` rule matched `git status; rm -rf ~`, `git log | sh`,
+   `$(...)`, backticks, redirects, and newlines. `config.rule_matches` now
+   rejects any command containing shell metacharacters before prefix
+   matching, and path rules match the resolved real path (no `../` escape).
+2. **Subagent read-boundary bypass (critical).** The `task` subagent called
+   tools directly, skipping the workspace read gate — it could read
+   `~/.aws/credentials` with no prompt. Subagent reads now go through
+   `confirm_outside_read` like top-level calls.
+3. **`lean_check` code execution (major).** `open IO in #eval …` walked past
+   the substring blocklist and ran shell commands at elaboration time. Added
+   `#eval`/`run_cmd`/`elab`/`macro`/`open IO`/`open System` to the blocklist.
+4. **Ctrl-C orphaned bash process groups (major).** Interrupting a
+   foreground command left it (and its children) running. The handler now
+   kills the process group and reaps on any `BaseException`.
+5. **Compact-on-overflow self-defeat (major).** `compact()` re-sent the same
+   oversized history to summarize and wedged the session. It now halves the
+   history and retries on overflow.
+6. **Bogus `/undo` checkpoints (major).** Failed edits pushed a no-op
+   checkpoint. Checkpoints are now discarded when the mutation returns an
+   error.
+7. **Corrupt/foreign session files crashed `-c` and `/resume` (major).**
+   `list_sessions`/`load` now validate shape and the callers handle load
+   errors; save uses pid-unique tmp names.
+8. **Minors:** MCP `_notify` BrokenPipe + `close()` killpg/reap + bounded
+   handshake timeout; `glob` `../` escape closed; malformed tool-call JSON
+   surfaced to the model instead of running with `{}`; redaction now covers
+   AWS-secret/`AIza`/`Bearer`/`.env KEY=value`; the `a` approval answer is
+   scoped to a rule (not the whole tool); `p` persists to the user config
+   only; Ctrl-C cancels prompts cleanly; slash commands are inside the REPL
+   exception guard. Added `[tool.ruff]` config and regression tests.
+
+## Phase 4 — Resume & robustness follow-ups (2026-07-08) — DONE
+
+1. **`/resume` and `-c` now restore the saved profile/model** and rebuild the
+   system prompt for the *current* cwd (tools resolve against it), warning
+   when the resumed session was started elsewhere. CLI `-P`/`-m` still win.
+2. **Trailing-`&` foreground bash no longer hangs.** The pipe is drained in a
+   reader thread; once bash exits we stop waiting instead of blocking on a
+   backgrounded grandchild holding stdout, reap the group, and tell the model
+   to use `run_in_background`.
+3. **Concurrent `clyde -c` can't clobber a session.** A pid-stamped lock file
+   (with stale-lock reclaim) makes a second `-c` in the same directory fork
+   to a new session instead of overwriting the first.
+4. **Token accounting is script-aware.** `estimate_tokens` counts ASCII at
+   ~4 chars/token and non-ASCII at ~1, so CJK/code-dense history no longer
+   under-counts; `_trim_history` uses it and targets 90% of the window.
+5. **MCP failure paths tested.** New tests cover a server dying mid-handshake
+   (non-fatal), a silent server (bounded handshake), and `close()` reaping
+   the whole process group.
+
+Still open (deliberately deferred): bare AWS *secret* keys with no key label
+remain unredacted — hard to distinguish a 40-char secret from any base64 blob.
+
 ## Phase 0 — Bug fixes (do before any new features, ~half a day)
 
 1. **Rich markup crash (critical).** Tool headers and approval panels

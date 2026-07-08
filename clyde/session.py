@@ -28,10 +28,20 @@ def save(path: str, agent, profile: str):
         ),
         "messages": agent.messages,
     }
-    tmp = path + ".tmp"
+    # pid-unique tmp name: two clyde processes saving the same session must
+    # not clobber each other's half-written file
+    tmp = f"{path}.{os.getpid()}.tmp"
     with open(tmp, "w") as f:
         json.dump(data, f)
     os.replace(tmp, path)
+
+
+def _valid(data) -> bool:
+    """True if this parsed JSON looks like a usable session file."""
+    return (isinstance(data, dict)
+            and isinstance(data.get("messages"), list)
+            and all(isinstance(m, dict) and "role" in m
+                    for m in data["messages"]))
 
 
 def list_sessions(cwd: str | None = None, limit: int = 10) -> list[dict]:
@@ -48,9 +58,11 @@ def list_sessions(cwd: str | None = None, limit: int = 10) -> list[dict]:
                 data = json.load(f)
         except (OSError, ValueError):
             continue
+        if not _valid(data):
+            continue  # foreign or corrupt file in the sessions dir
         if cwd and data.get("cwd") != cwd:
             continue
-        n_turns = sum(1 for m in data.get("messages", []) if m["role"] == "user")
+        n_turns = sum(1 for m in data["messages"] if m.get("role") == "user")
         out.append({
             "path": fpath,
             "updated": data.get("updated", 0),
@@ -65,5 +77,70 @@ def list_sessions(cwd: str | None = None, limit: int = 10) -> list[dict]:
 
 
 def load(path: str) -> dict:
+    """Load a session file. Raises OSError or ValueError if unusable."""
     with open(path) as f:
-        return json.load(f)
+        data = json.load(f)
+    if not _valid(data):
+        raise ValueError(f"{path} is not a clyde session file")
+    return data
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+    except OSError:
+        return False
+    return True
+
+
+def claim(path: str) -> str:
+    """Claim a session file for this process so two concurrent `clyde -c`
+    runs in the same directory don't overwrite each other's history.
+
+    Returns `path` if we got it, or a fresh session path (forking the
+    conversation) if another *live* process already holds it. A stale lock
+    left by a crashed process is reclaimed. Best-effort: if locking isn't
+    possible at all, just use `path`."""
+    lock = path + ".lock"
+    for _ in range(2):
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            return path
+        except FileExistsError:
+            try:
+                with open(lock) as f:
+                    holder = int(f.read().strip() or "0")
+            except (OSError, ValueError):
+                holder = 0
+            if holder != os.getpid() and _pid_alive(holder):
+                return new_session_path()  # another clyde owns it; fork
+            try:
+                os.unlink(lock)  # stale lock from a dead process; retry
+            except OSError:
+                return new_session_path()
+        except OSError:
+            return path  # e.g. read-only fs — proceed without a lock
+    return new_session_path()
+
+
+def release(path: str):
+    """Drop a lock previously taken by claim(), if this process holds it."""
+    lock = path + ".lock"
+    try:
+        with open(lock) as f:
+            holder = int(f.read().strip() or "0")
+    except (OSError, ValueError):
+        return
+    if holder == os.getpid():
+        try:
+            os.unlink(lock)
+        except OSError:
+            pass

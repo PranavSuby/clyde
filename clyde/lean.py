@@ -52,9 +52,14 @@ TOOL_SCHEMA = {
 
 # Tokens that turn a "proof checker" into an arbitrary code runner or that
 # silently sidestep real verification. Rejected before Lean ever runs.
+# `#eval`/`run_cmd`/`elab`/`macro` execute code at elaboration time, and
+# `open IO` un-qualifies the blocked IO.* names — a proof needs none of them.
 _FORBIDDEN = (
     "IO.Process", "IO.FS", "System.FilePath", "System.Platform",
     "@[extern", "@[implemented_by", "unsafe ", "initialize ",
+    "#eval", "run_cmd", "run_elab", "run_meta",
+    "open IO", "open System",
+    "elab ", "elab_rules", "macro ", "macro_rules",
 )
 # Cheats that make Lean accept a non-proof.
 _CHEATS = ("sorry", "admit")

@@ -13,10 +13,10 @@ from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
 
-from .approval import ApprovalPolicy
-from .streaming import ThinkFilter  # noqa: F401 — re-exported
 from . import tools
+from .approval import ApprovalPolicy
 from .providers import BaseProvider, ContextOverflowError, ProviderError
+from .streaming import ThinkFilter  # noqa: F401 — re-exported
 
 CONTEXT_FILES = ("CLYDE.md", "AGENTS.md", "CLAUDE.md")
 
@@ -30,6 +30,13 @@ _REDACT_PATTERNS = [
     (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,}\b"), "[redacted-github-token]"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{24,}\b"), "[redacted-api-key]"),
     (re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"), "[redacted-slack-token]"),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"), "[redacted-google-key]"),
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{16,}"), "Bearer [redacted]"),
+    # KEY=value / key: value lines (.env dumps, YAML/JSON config)
+    (re.compile(r"(?im)^(\s*(?:export\s+)?[\"']?[\w.-]*"
+                r"(?:secret|token|passwd|password|api_?key|access_key)"
+                r"[\w.-]*[\"']?\s*[=:]\s*[\"']?)([^\s\"']{8,})"),
+     r"\1[redacted]"),
 ]
 
 
@@ -39,6 +46,19 @@ def redact_secrets(text: str) -> str:
     for pattern, replacement in _REDACT_PATTERNS:
         text = pattern.sub(replacement, text)
     return text
+
+
+def estimate_tokens(text: str) -> int:
+    """Rough token count that doesn't wildly under-count non-Latin scripts.
+
+    ASCII text is ~4 chars/token; CJK and other non-ASCII is closer to ~1
+    char/token. A flat chars/N divisor under-counts the latter by 3-4x,
+    which is exactly when a session silently overflows. Counting ASCII and
+    non-ASCII separately keeps the estimate a safe over-approximation."""
+    if not text:
+        return 0
+    ascii_chars = len(text.encode("ascii", "ignore"))  # C-fast
+    return ascii_chars // 4 + (len(text) - ascii_chars)
 
 
 SYSTEM_PROMPT = """\
@@ -250,15 +270,17 @@ class Agent:
         return getattr(self.provider, "num_ctx", None) \
             or getattr(self.provider, "context_window", None)
 
-    def _estimated_prompt_tokens(self) -> int:
-        """Client-side estimate (~3.5 chars/token). Backstop for providers
-        that under-report (Ollama omits KV-cache-hit tokens) or not at all."""
-        chars = sum(
-            len(str(m.get("content") or ""))
-            + (len(json.dumps(m["tool_calls"])) if m.get("tool_calls") else 0)
-            for m in self.messages
+    @staticmethod
+    def _msg_tokens(m: dict) -> int:
+        return estimate_tokens(str(m.get("content") or "")) + (
+            estimate_tokens(json.dumps(m["tool_calls"]))
+            if m.get("tool_calls") else 0
         )
-        return int(chars / 3.5)
+
+    def _estimated_prompt_tokens(self) -> int:
+        """Client-side token estimate. Backstop for providers that
+        under-report (Ollama omits KV-cache-hit tokens) or not at all."""
+        return sum(self._msg_tokens(m) for m in self.messages)
 
     def ctx_percent(self) -> int | None:
         window = self._context_size()
@@ -531,6 +553,17 @@ class Agent:
                 backup = None
         self.checkpoints.append((path, backup))
 
+    def _discard_checkpoint(self):
+        """Drop the checkpoint just taken for a mutation that failed."""
+        if not self.checkpoints:
+            return
+        _, backup = self.checkpoints.pop()
+        if backup:
+            try:
+                os.remove(backup)
+            except OSError:
+                pass
+
     def undo(self):
         """Restore the file state before the last edit/write (/undo)."""
         import shutil
@@ -611,9 +644,15 @@ class Agent:
                     f"({escape(_args_preview(tc['name'], tc['arguments']))})[/dim]",
                     highlight=False)
                 if tc["name"] in tools.SUBAGENT_TOOL_NAMES:
-                    result = tools.execute(
-                        tc["name"], tc["arguments"],
-                        self.cfg.get("max_tool_output_chars", 12000))
+                    # same workspace read boundary as top-level tool calls
+                    outside = tools.outside_workspace(tc["name"], tc["arguments"])
+                    if outside and not self.approval.confirm_outside_read(outside):
+                        result = ("Error: the user denied reading outside "
+                                  "the workspace.")
+                    else:
+                        result = tools.execute(
+                            tc["name"], tc["arguments"],
+                            self.cfg.get("max_tool_output_chars", 12000))
                 else:
                     result = "Error: subagents may only use read-only tools"
                 messages.append({"role": "tool", "tool_call_id": tc["id"],
@@ -636,13 +675,21 @@ class Agent:
                 self.console.print("  " + line[:200], style="dim",
                                    markup=False, highlight=False)
 
-        outside = tools.outside_workspace(name, args)
-        approved = self.approval.approve(
-            name, args, preview=lambda: self._render_change_preview(name, args))
-        if approved and outside:
-            approved = self.approval.confirm_outside_read(outside)
+        malformed = tools.malformed_args_error(args)
+        if malformed:
+            approved = False
+        else:
+            outside = tools.outside_workspace(name, args)
+            approved = self.approval.approve(
+                name, args,
+                preview=lambda: self._render_change_preview(name, args))
+            if approved and outside:
+                approved = self.approval.confirm_outside_read(outside)
 
-        if not approved:
+        if malformed:
+            result = malformed
+            self.console.print("[red]  malformed arguments[/red]")
+        elif not approved:
             result = "Error: user denied this tool call. Ask before retrying."
             self.console.print("[red]  denied[/red]")
         elif name == "task":
@@ -655,6 +702,9 @@ class Agent:
                 name, args, self.cfg.get("max_tool_output_chars", 12000),
                 on_line=live_line if name == "bash" else None,
             )
+            if name in ("edit_file", "write_file") \
+                    and result.startswith("Error"):
+                self._discard_checkpoint()  # nothing changed; keep /undo honest
         result = redact_secrets(result)
         all_lines = result.splitlines()
         if name == "bash" and streamed["n"]:
@@ -691,29 +741,45 @@ class Agent:
                 "and next steps. Output only the summary."
             ),
         }
+        # The summary request itself can overflow the context (that's often
+        # why we're compacting) — on overflow, retry on the newer half.
+        history = list(self.messages)
         parts: list[str] = []
-        think = ThinkFilter()
-        state: dict = {"last_kind": None, "midline": False}
-        try:
-            for kind, payload in self.provider.chat(self.messages + [ask], []):
-                if kind == "text":
-                    for fkind, ftext in think.feed(payload):
-                        if fkind == "text":
-                            parts.append(ftext)
-                        self._print_stream("thinking", ftext, state)
-            for fkind, ftext in think.flush():
-                if fkind == "text":
-                    parts.append(ftext)
-        except KeyboardInterrupt:
-            self._end_stream(state)
-            self.console.print("[yellow]Compact interrupted; history unchanged.[/yellow]")
+        for _ in range(4):
+            parts = []
+            think = ThinkFilter()
+            state: dict = {"last_kind": None, "midline": False}
+            try:
+                for kind, payload in self.provider.chat(history + [ask], []):
+                    if kind == "text":
+                        for fkind, ftext in think.feed(payload):
+                            if fkind == "text":
+                                parts.append(ftext)
+                            self._print_stream("thinking", ftext, state)
+                for fkind, ftext in think.flush():
+                    if fkind == "text":
+                        parts.append(ftext)
+                break
+            except KeyboardInterrupt:
+                self.console.print("[yellow]Compact interrupted; history unchanged.[/yellow]")
+                return
+            except ContextOverflowError:
+                if len(history) <= 3:
+                    self.console.print("[red]Compact failed: history too "
+                                       "large to summarize.[/red]")
+                    return
+                history = [history[0]] + history[len(history) // 2:]
+                while len(history) > 1 and history[1]["role"] == "tool":
+                    del history[1]
+            except ProviderError as e:
+                self.console.print(f"[red]Compact failed: {escape(str(e))}[/red]")
+                return
+            finally:
+                self._end_stream(state)
+        else:
+            self.console.print("[red]Compact failed: could not fit the "
+                               "history into the context window.[/red]")
             return
-        except ProviderError as e:
-            self._end_stream(state)
-            self.console.print(f"[red]Compact failed: {escape(str(e))}[/red]")
-            return
-        finally:
-            self._end_stream(state)
         summary = "".join(parts).strip()
         if not summary:
             self.console.print("[red]Compact failed: empty summary.[/red]")
@@ -776,15 +842,16 @@ class Agent:
             )
 
     def _trim_history(self):
-        """Drop oldest turns when history gets too big (rough char budget)."""
-        budget = (self._context_size() or 32768) * 3  # ~3 chars/token, conservative
-        def size(m):
-            return len(str(m.get("content") or "")) + (
-                len(json.dumps(m["tool_calls"])) if m.get("tool_calls") else 0
-            )
-
-        while len(self.messages) > 3 and sum(map(size, self.messages)) > budget:
+        """Drop oldest turns when the estimated prompt would exceed the
+        context window. A hard backstop below the auto-compact threshold —
+        leaves ~10% headroom for the model's response."""
+        window = self._context_size() or 32768
+        budget = int(window * 0.9)
+        total = sum(self._msg_tokens(m) for m in self.messages)
+        while len(self.messages) > 3 and total > budget:
             # remove the oldest non-system message, plus orphaned tool results
+            total -= self._msg_tokens(self.messages[1])
             del self.messages[1]
             while len(self.messages) > 1 and self.messages[1]["role"] == "tool":
+                total -= self._msg_tokens(self.messages[1])
                 del self.messages[1]

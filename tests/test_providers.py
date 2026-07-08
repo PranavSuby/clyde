@@ -112,10 +112,12 @@ def test_ollama_wire_helpers():
     assert calls[0]["name"] == "bash"
     assert calls[0]["arguments"] == {"command": "ls"}
     assert calls[0]["id"].startswith("call_")
-    # bad JSON arguments degrade to an empty dict, never raise
+    # bad JSON arguments are flagged for the tool layer, never raise
     bad = ollama_wire.parse_tool_calls(
         {"tool_calls": [{"function": {"name": "x", "arguments": "{not json"}}]})
-    assert bad[0]["arguments"] == {}
+    assert bad[0]["arguments"] == {"_malformed_json": "{not json"}
+    from clyde import tools as _tools
+    assert _tools.malformed_args_error(bad[0]["arguments"]).startswith("Error:")
     assert ollama_wire.parse_usage(
         {"prompt_eval_count": 12, "eval_count": 3}) == {
         "prompt_tokens": 12, "completion_tokens": 3}

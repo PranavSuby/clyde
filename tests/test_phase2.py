@@ -69,3 +69,36 @@ def test_mcp_stub_roundtrip():
         assert server.call("echo", {"text": "hi"}) == "echo: hi"
     finally:
         server.close()
+
+
+def test_mcp_dead_server_is_not_fatal():
+    # a server that dies right after `initialize` must not crash startup
+    from clyde.mcp import load_servers
+    cfg = {"mcp_servers": {"dead": {
+        "command": [sys.executable, STUB, "die-after-init"], "timeout": 2.0}}}
+    assert load_servers(cfg) == {}  # reported, not raised
+
+
+def test_mcp_silent_server_handshake_is_bounded():
+    # a server that never speaks must time out quickly, not hang startup
+    from clyde.mcp import load_servers
+    start = time.time()
+    cfg = {"mcp_servers": {"mute": {
+        "command": [sys.executable, STUB, "silent"], "timeout": 1.0}}}
+    assert load_servers(cfg) == {}
+    assert time.time() - start < 8
+
+
+def test_mcp_close_reaps_process_group(tmp_path):
+    from clyde.session import _pid_alive
+    pidfile = tmp_path / "child.pid"
+    server = MCPServer(
+        "stub", [sys.executable, STUB, "spawn-child", str(pidfile)], timeout=10)
+    child_pid = int(pidfile.read_text().strip())
+    assert _pid_alive(child_pid)
+    server.close()
+    assert server.proc.poll() is not None  # reaped, not left a zombie
+    deadline = time.time() + 3
+    while _pid_alive(child_pid) and time.time() < deadline:
+        time.sleep(0.05)
+    assert not _pid_alive(child_pid)  # the group child was killed too

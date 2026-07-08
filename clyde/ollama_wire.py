@@ -25,10 +25,14 @@ def parse_tool_calls(msg: dict) -> list[dict]:
         fn = tc.get("function", {})
         args = fn.get("arguments") or {}
         if isinstance(args, str):
+            raw = args
             try:
                 args = json.loads(args)
             except json.JSONDecodeError:
-                args = {}
+                # let the tool layer report the parse failure to the model
+                args = {"_malformed_json": raw}
+        if not isinstance(args, dict):
+            args = {"_malformed_json": json.dumps(args)}
         calls.append({
             "id": new_call_id(),
             "name": fn.get("name", ""),

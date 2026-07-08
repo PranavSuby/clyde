@@ -270,10 +270,14 @@ def outside_workspace(name: str, args: dict) -> str | None:
         return None
     raw = args.get("path") or "."
     if name == "glob":
-        # an absolute pattern ignores the path arg entirely
         pattern = os.path.expanduser(str(args.get("pattern") or ""))
+        static = pattern.split("*")[0].split("?")[0].split("[")[0]
         if os.path.isabs(pattern):
-            raw = pattern.split("*")[0].split("?")[0] or "/"
+            # an absolute pattern ignores the path arg entirely
+            raw = static or "/"
+        elif static:
+            # a relative pattern can still climb out via ".." components
+            raw = os.path.join(str(raw), static)
     target = os.path.realpath(_resolve(str(raw)))
     home_cfg = os.path.realpath(os.path.expanduser("~/.config/clyde"))
     if target == root or target.startswith(root + os.sep) \
@@ -321,8 +325,21 @@ def _truncate(text: str, max_chars: int) -> str:
     return text[:half] + f"\n... [{omitted} chars truncated] ...\n" + text[-half:]
 
 
+def malformed_args_error(args: dict) -> str | None:
+    """The providers mark tool calls whose argument JSON didn't parse;
+    surface that to the model instead of running with empty args."""
+    if not isinstance(args, dict) or "_malformed_json" not in args:
+        return None
+    return ("Error: the arguments for this tool call were not valid JSON "
+            f"(received: {str(args['_malformed_json'])[:200]!r}). "
+            "Re-issue the call with correctly encoded JSON arguments.")
+
+
 def execute(name: str, args: dict, max_chars: int = 12000, on_line=None) -> str:
     """Run a tool and return its result as a string (errors included, never raises)."""
+    err = malformed_args_error(args)
+    if err:
+        return err
     try:
         fn = _IMPLS.get(name)
         if fn is None:
@@ -405,8 +422,12 @@ def _bash(args: dict, on_line=None) -> str:
     timer = threading.Timer(timeout, _on_timeout)
     timer.start()
     lines: list[str] = []
-    pending_blanks = 0  # hold blanks: the cwd marker's printf adds one
-    try:
+
+    def _reader():
+        # Draining the pipe in its own thread lets us stop waiting the moment
+        # the bash process exits — even if a backgrounded grandchild
+        # (`server &`) is still holding the stdout pipe open.
+        pending_blanks = 0  # hold blanks: the cwd marker's printf adds one
         for line in proc.stdout:
             lines.append(line)
             if not on_line or _CWD_MARKER in line:
@@ -418,7 +439,27 @@ def _bash(args: dict, on_line=None) -> str:
                 on_line("")
             pending_blanks = 0
             on_line(line.rstrip("\n"))
+
+    reader = threading.Thread(target=_reader, daemon=True)
+    reader.start()
+    leaked_bg = False
+    try:
+        proc.wait()  # the bash process itself is done
+        reader.join(timeout=0.3)  # let buffered output drain
+        if reader.is_alive():
+            # bash exited but the pipe is still open: a process it spawned in
+            # the background outlived it. Don't block for the full timeout —
+            # reap the group and move on.
+            leaked_bg = True
+            _kill_group(proc)
+            reader.join(timeout=1.0)
+    except BaseException:
+        # Ctrl-C etc.: the child is in its own process group, so the
+        # terminal's SIGINT never reaches it — kill it ourselves.
+        _kill_group(proc)
         proc.wait()
+        reader.join(timeout=1.0)
+        raise
     finally:
         timer.cancel()
     if timed_out.is_set():
@@ -438,6 +479,10 @@ def _bash(args: dict, on_line=None) -> str:
     out = stdout
     if proc.returncode != 0:
         out += f"\n[exit code {proc.returncode}]"
+    if leaked_bg:
+        out += ("\n[note: the command returned but left a process holding the "
+                "output stream open (e.g. a trailing '&'); it was terminated. "
+                "For servers or long tasks use run_in_background instead.]")
     return out.strip() or "(no output)"
 
 
