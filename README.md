@@ -103,10 +103,34 @@ To use Ollama Cloud directly (without the local daemon as proxy):
 ## Tools
 
 The agent can call: `bash`, `read_file`, `write_file`, `edit_file`,
-`todo_write`, `list_dir`, `glob`, `grep`. Mutating tools (`bash`,
-`write_file`, `edit_file`) prompt for approval — answer `y`, `n`, or `a`
-(always, this session). The agent must `read_file` an existing file before
-it is allowed to edit or overwrite it.
+`todo_write`, `list_dir`, `glob`, `grep`, `lean_check`. Mutating tools
+(`bash`, `write_file`, `edit_file`) prompt for approval — answer `y`, `n`,
+or `a` (always, this session). The agent must `read_file` an existing file
+before it is allowed to edit or overwrite it.
+
+## Lean proof checking
+
+When asked to prove or verify a mathematical claim, the agent formalizes it
+as **Lean 4** code and the `lean_check` tool compiles it against
+**Mathlib** — so a "verified" answer is Lean's word, not the model's. Proofs
+containing `sorry`/`admit` are rejected, as is code that would do I/O.
+
+**Setup.** Needs Lean installed via [`elan`](https://lean-lang.org/install/)
+and a Lake project with Mathlib built:
+
+```bash
+curl https://elan.lean-lang.org/elan-init.sh -sSf | sh -s -- -y
+
+mkdir -p ~/.local/share/clyde/lean && cd ~/.local/share/clyde/lean
+lake init clyde_lean math      # wires in Mathlib
+lake exe cache get             # prebuilt Mathlib oleans (no long compile)
+lake build
+```
+
+Paths and the compile timeout live under the `lean` key in the config; set
+`"enabled": false` to turn the feature off (the tool is then hidden from the
+model). If `~/.local/share/clydesk/lean` already holds a Mathlib build (from
+clyde-desktop), it is reused automatically — no second multi-GB build.
 
 ## Project context
 

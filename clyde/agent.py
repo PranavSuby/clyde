@@ -105,6 +105,11 @@ Never invent file paths, APIs, or command output. If unsure, check with a tool.
 information.
 - File paths passed to tools should be absolute, or relative to the working \
 directory shown below.
+- When the user asks you to prove, disprove, or verify a mathematical claim, \
+do not just assert an answer: work out the proof, formalize it as Lean 4 \
+code, and call lean_check so Lean itself verifies it. If Lean rejects it, \
+read the error, fix the Lean, and try again (a few attempts). Report whether \
+Lean confirmed the proof.
 """
 
 
@@ -227,7 +232,9 @@ class Agent:
         ]
 
     def clear(self):
-        self.messages = [self.messages[0]]
+        self.messages = [
+            {"role": "system", "content": build_system_prompt(self.cwd)}
+        ]
         self.last_usage = {}
         tools._READ_FILES.clear()
 
@@ -301,6 +308,8 @@ class Agent:
         if is_edit:
             old_s = args.get("old_string", "").replace("\r\n", "\n")
             new_s = args.get("new_string", "").replace("\r\n", "\n")
+            if not old_s:
+                return None  # the tool will reject this; don't preview garbage
             if args.get("replace_all"):
                 new_content = old_content.replace(old_s, new_s)
             else:
@@ -472,7 +481,10 @@ class Agent:
                     continue
                 self.had_error = True
                 self.console.print(f"[red]Provider error:[/red] {escape(str(e))}")
-                # keep history consistent: drop nothing, just stop the turn
+                # keep whatever streamed in history so the user can refer to it
+                partial = "".join(text_parts).strip()
+                if partial:
+                    self.messages.append({"role": "assistant", "content": partial})
                 return
             except KeyboardInterrupt:
                 self._end_stream(state)
@@ -522,13 +534,33 @@ class Agent:
 
     def _tool_schemas(self) -> list[dict]:
         from . import mcp
-        return tools.TOOL_SCHEMAS + mcp.tool_schemas(self.mcp_servers)
+        schemas = tools.TOOL_SCHEMAS
+        if not (self.cfg.get("lean") or {}).get("enabled", True):
+            schemas = [s for s in schemas
+                       if s["function"]["name"] != "lean_check"]
+        return schemas + mcp.tool_schemas(self.mcp_servers)
+
+    @staticmethod
+    def _prune_checkpoints(max_age_days: float = 7):
+        """Old checkpoint snapshots are unreachable (the list lives in
+        memory); delete them so the directory doesn't grow forever."""
+        import time as _time
+        cutoff = _time.time() - max_age_days * 86400
+        try:
+            for fname in os.listdir(CHECKPOINT_DIR):
+                fpath = os.path.join(CHECKPOINT_DIR, fname)
+                if os.path.getmtime(fpath) < cutoff:
+                    os.remove(fpath)
+        except OSError:
+            pass
 
     def _checkpoint(self, name: str, args: dict):
         """Snapshot the target file so /undo can restore it."""
         if name not in ("edit_file", "write_file"):
             return
         import shutil
+        if not self.checkpoints:
+            self._prune_checkpoints()
         path = tools._resolve(str(args.get("path", "")))
         backup = None
         if os.path.isfile(path):
@@ -550,6 +582,10 @@ class Agent:
         try:
             if backup:
                 shutil.copy2(backup, path)
+                try:
+                    os.remove(backup)
+                except OSError:
+                    pass
                 self.console.print(f"[green]Restored {path}[/green]")
             elif os.path.exists(path):
                 os.remove(path)

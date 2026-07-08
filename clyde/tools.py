@@ -6,6 +6,8 @@ import os
 import shutil
 import subprocess
 
+from . import lean
+
 TOOL_SCHEMAS = [
     {
         "type": "function",
@@ -244,6 +246,7 @@ TOOL_SCHEMAS = [
             },
         },
     },
+    lean.TOOL_SCHEMA,
 ]
 
 # Tools that mutate state and need user approval (unless --yolo).
@@ -266,10 +269,15 @@ def outside_workspace(name: str, args: dict) -> str | None:
     if root is None or name not in ("read_file", "list_dir", "glob", "grep"):
         return None
     raw = args.get("path") or "."
+    if name == "glob":
+        # an absolute pattern ignores the path arg entirely
+        pattern = os.path.expanduser(str(args.get("pattern") or ""))
+        if os.path.isabs(pattern):
+            raw = pattern.split("*")[0].split("?")[0] or "/"
     target = os.path.realpath(_resolve(str(raw)))
     home_cfg = os.path.realpath(os.path.expanduser("~/.config/clyde"))
     if target == root or target.startswith(root + os.sep) \
-            or target.startswith(home_cfg):
+            or target == home_cfg or target.startswith(home_cfg + os.sep):
         return None
     return target
 
@@ -370,6 +378,7 @@ def _bash(args: dict, on_line=None) -> str:
             stdout=log, stderr=subprocess.STDOUT, text=True,
             start_new_session=True,
         )
+        log.close()  # the child holds its own handle
         bg_id = _BG_NEXT_ID[0]
         _BG_NEXT_ID[0] += 1
         _BG_PROCS[bg_id] = {"proc": proc, "log": log.name,
@@ -413,7 +422,11 @@ def _bash(args: dict, on_line=None) -> str:
     finally:
         timer.cancel()
     if timed_out.is_set():
-        return f"Error: command timed out after {timeout}s (process group killed)"
+        partial = "".join(lines).strip()
+        msg = f"Error: command timed out after {timeout}s (process group killed)"
+        if partial:
+            msg += "\nOutput before the timeout:\n" + partial[-2000:]
+        return msg
 
     stdout = "".join(lines)
     marker_at = stdout.rfind(_CWD_MARKER)
@@ -538,7 +551,9 @@ def _glob(args: dict) -> str:
     root = _resolve(args.get("path") or ".")
     matches = globmod.glob(args["pattern"], root_dir=root, recursive=True)
     matches = [
-        m for m in matches
+        # join with root so results resolve correctly from the shell cwd
+        os.path.join(root, m) if root != (_SHELL["cwd"] or os.getcwd()) else m
+        for m in matches
         if not any(part in SKIP_DIRS for part in m.split(os.sep))
     ]
     matches.sort()
@@ -618,4 +633,5 @@ _IMPLS = {
     "list_dir": _list_dir,
     "glob": _glob,
     "grep": _grep,
+    "lean_check": lean.run,
 }

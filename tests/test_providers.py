@@ -71,3 +71,23 @@ def test_http_error_raises_provider_error():
     p = make_provider(lambda req: httpx.Response(500, text="boom"))
     with pytest.raises(ProviderError):
         list(p.chat([{"role": "user", "content": "x"}], []))
+
+
+def test_ollama_wire_helpers():
+    from clyde import ollama_wire
+    # string-encoded arguments are tolerated and decoded
+    calls = ollama_wire.parse_tool_calls(
+        {"tool_calls": [{"function": {"name": "bash",
+                                      "arguments": '{"command": "ls"}'}}]})
+    assert calls[0]["name"] == "bash"
+    assert calls[0]["arguments"] == {"command": "ls"}
+    assert calls[0]["id"].startswith("call_")
+    # bad JSON arguments degrade to an empty dict, never raise
+    bad = ollama_wire.parse_tool_calls(
+        {"tool_calls": [{"function": {"name": "x", "arguments": "{not json"}}]})
+    assert bad[0]["arguments"] == {}
+    assert ollama_wire.parse_usage(
+        {"prompt_eval_count": 12, "eval_count": 3}) == {
+        "prompt_tokens": 12, "completion_tokens": 3}
+    assert ollama_wire.is_local_url("http://localhost:11434")
+    assert not ollama_wire.is_local_url("https://api.openrouter.ai")

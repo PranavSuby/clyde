@@ -41,6 +41,15 @@ DEFAULT_CONFIG = {
     "permissions": {"allow": []},
     # MCP servers (stdio): {"name": {"command": ["npx", "-y", "some-mcp"]}}
     "mcp_servers": {},
+    # Lean 4 proof checking (lean_check tool). The project dir holds a Lake
+    # project with Mathlib as a built dependency; see README for setup.
+    # Falls back to an existing ~/.local/share/clydesk/lean build.
+    "lean": {
+        "enabled": True,
+        "project_dir": "~/.local/share/clyde/lean",
+        "elan_bin": "~/.elan/bin",
+        "timeout": 90,
+    },
     "auto_start_ollama": True,
     "max_tool_output_chars": 12000,
     "max_iterations": 40,
@@ -103,7 +112,8 @@ def rule_matches(rule: str, name: str, args: dict) -> bool:
     pattern = pattern.rstrip(")")
     if rule_tool != name:
         return False
-    target = args.get("command", "") if name == "bash" else str(args.get("path", ""))
+    target = args.get("command", "").strip() if name == "bash" \
+        else str(args.get("path", ""))
     if pattern.endswith("*"):
         return target.startswith(pattern[:-1])
     return target == pattern

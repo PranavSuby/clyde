@@ -17,17 +17,14 @@ import os
 import shutil
 import subprocess
 import time
-import uuid
 
 import httpx
+
+from .ollama_wire import is_local_url, new_call_id, parse_tool_calls, parse_usage
 
 
 class ProviderError(Exception):
     pass
-
-
-def _new_call_id() -> str:
-    return "call_" + uuid.uuid4().hex[:12]
 
 
 def _gpu_vram_bytes() -> int:
@@ -88,9 +85,7 @@ class OllamaProvider(BaseProvider):
         self.num_ctx = num_ctx if isinstance(num_ctx, int) else None
 
     def _is_local(self) -> bool:
-        from urllib.parse import urlparse
-        host = urlparse(self.base_url).hostname or ""
-        return host in ("localhost", "127.0.0.1", "::1")
+        return is_local_url(self.base_url)
 
     def model_details(self) -> dict:
         """Probe the model: max context, KV cache cost/token, weight size."""
@@ -239,24 +234,9 @@ class OllamaProvider(BaseProvider):
                         yield ("thinking", msg["thinking"])
                     if msg.get("content"):
                         yield ("text", msg["content"])
-                    for tc in msg.get("tool_calls") or []:
-                        fn = tc.get("function", {})
-                        args = fn.get("arguments") or {}
-                        if isinstance(args, str):
-                            try:
-                                args = json.loads(args)
-                            except json.JSONDecodeError:
-                                args = {}
-                        tool_calls.append({
-                            "id": _new_call_id(),
-                            "name": fn.get("name", ""),
-                            "arguments": args,
-                        })
+                    tool_calls.extend(parse_tool_calls(msg))
                     if chunk.get("done"):
-                        usage = {
-                            "prompt_tokens": chunk.get("prompt_eval_count", 0),
-                            "completion_tokens": chunk.get("eval_count", 0),
-                        }
+                        usage = parse_usage(chunk)
         except httpx.HTTPError as e:
             raise ProviderError(f"Cannot reach Ollama at {self.base_url}: {e}") from e
 
@@ -389,7 +369,7 @@ class OpenAIProvider(BaseProvider):
                 except json.JSONDecodeError:
                     args = {}
                 tool_calls.append({
-                    "id": slot["id"] or _new_call_id(),
+                    "id": slot["id"] or new_call_id(),
                     "name": slot["name"],
                     "arguments": args,
                 })
@@ -433,8 +413,7 @@ def make_provider(profile: dict, model_override: str | None = None) -> BaseProvi
 
 def ensure_ollama_running(base_url: str, auto_start: bool = True) -> bool:
     """If the profile points at a local Ollama, start the daemon if needed."""
-    from urllib.parse import urlparse
-    if (urlparse(base_url).hostname or "") not in ("localhost", "127.0.0.1", "::1"):
+    if not is_local_url(base_url):
         return True
 
     def _is_ollama() -> bool:

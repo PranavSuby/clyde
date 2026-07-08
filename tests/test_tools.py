@@ -12,6 +12,39 @@ def fresh_state(tmp_path):
     yield
 
 
+def test_glob_with_path_returns_resolvable_paths(tmp_path):
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "a.py").write_text("x\n")
+    out = tools.execute("glob", {"pattern": "*.py", "path": "sub"})
+    # results must be readable as given, not bare basenames relative to nothing
+    line = out.splitlines()[0]
+    assert tools.execute("read_file", {"path": line}).strip().endswith("x")
+
+
+def test_glob_absolute_pattern_flagged_outside_workspace(tmp_path):
+    tools.set_workspace(str(tmp_path))
+    try:
+        assert tools.outside_workspace("glob", {"pattern": "/etc/*"}) == "/etc"
+        assert tools.outside_workspace("glob", {"pattern": "*.py"}) is None
+    finally:
+        tools._WORKSPACE["root"] = None
+
+
+def test_config_dir_prefix_not_overmatched(tmp_path):
+    tools.set_workspace(str(tmp_path))
+    try:
+        evil = os.path.expanduser("~/.config/clyde-evil/secrets")
+        assert tools.outside_workspace("read_file", {"path": evil}) is not None
+    finally:
+        tools._WORKSPACE["root"] = None
+
+
+def test_bash_timeout_keeps_partial_output(tmp_path):
+    r = tools.execute("bash", {"command": "echo early; sleep 30", "timeout": 1})
+    assert "timed out" in r
+    assert "early" in r
+
+
 def test_read_gate_blocks_unread(tmp_path):
     p = tmp_path / "f.txt"
     p.write_text("hello\n")

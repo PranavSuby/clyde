@@ -33,7 +33,12 @@ def expand_mentions(text: str, console: Console) -> str:
     for raw in dict.fromkeys(_MENTION_RE.findall(text)):
         path = os.path.expanduser(raw)
         if not os.path.isfile(path):
-            continue
+            # "look at @foo.py." — the sentence's punctuation is not the path
+            trimmed = raw.rstrip(".,:;!?")
+            if trimmed != raw and os.path.isfile(os.path.expanduser(trimmed)):
+                raw, path = trimmed, os.path.expanduser(trimmed)
+            else:
+                continue
         try:
             with open(path, "r", errors="replace") as f:
                 content = f.read()
@@ -222,6 +227,10 @@ def main():
 
     state = {"profile": profile_name, "session_path": session_path}
 
+    def close_mcp():
+        for server in agent.mcp_servers.values():
+            server.close()
+
     # One-shot mode
     if args.prompt:
         if not args.yolo and not sys.stdin.isatty():
@@ -230,8 +239,11 @@ def main():
                 "answered. Re-run with --yolo for non-interactive use.[/red]"
             )
             sys.exit(2)
-        agent.run_turn(expand_mentions(" ".join(args.prompt), console))
-        save_session()
+        try:
+            agent.run_turn(expand_mentions(" ".join(args.prompt), console))
+        finally:
+            save_session()
+            close_mcp()
         sys.exit(1 if agent.had_error else 0)
 
     console.print(
@@ -249,6 +261,14 @@ def main():
             label += f" · ctx {pct}%"
         return label
 
+    try:
+        _repl_loop(session, agent, cfg, state, console, rprompt, save_session)
+    finally:
+        close_mcp()
+    console.print("[dim]bye[/dim]")
+
+
+def _repl_loop(session, agent, cfg, state, console, rprompt, save_session):
     while True:
         try:
             line = session.prompt("\n❯ ", rprompt=rprompt).strip()
@@ -275,8 +295,6 @@ def main():
                 f"Please report the traceback above.[/red]"
             )
         save_session()
-
-    console.print("[dim]bye[/dim]")
 
 
 if __name__ == "__main__":
