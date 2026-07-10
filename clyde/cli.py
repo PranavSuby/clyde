@@ -21,7 +21,7 @@ from rich.markup import escape
 
 from . import __version__, config, tools
 from . import session as session_mod
-from .agent import Agent, build_system_prompt
+from .agent import Agent, build_system_prompt, redact_secrets
 from .providers import ProviderError, ensure_ollama_running, make_provider
 
 _MENTION_RE = re.compile(r"@([~\w./\\-]+)")
@@ -45,11 +45,21 @@ def expand_mentions(text: str, console: Console) -> str:
                 content = f.read()
         except OSError:
             continue
+        # Same net as tool results: attached content enters the conversation,
+        # may leave the machine on a cloud profile, and is saved to disk with
+        # the session — so credentials get redacted here too.
+        content = redact_secrets(content)
         if len(content) > 20000:
             content = content[:20000] + "\n... (file truncated at 20k chars)"
-        tools._mark_read(path)  # mentioned file may be edited without re-read
+        # abspath: mentions are typed relative to the process cwd, while
+        # outside_workspace resolves bare relative paths against the model's
+        # persistent shell cwd (which may have `cd`-ed elsewhere)
+        outside = tools.outside_workspace("read_file", {"path": os.path.abspath(path)})
+        if outside is None:
+            tools._mark_read(path)  # mentioned file may be edited without re-read
+        note = " · outside workspace" if outside else ""
         blocks.append(f"--- {raw} ---\n{content}")
-        console.print(f"[dim]attached {raw} ({len(content)} chars)[/dim]")
+        console.print(f"[dim]attached {raw} ({len(content)} chars){note}[/dim]")
     if blocks:
         return text + "\n\nAttached files:\n" + "\n\n".join(blocks)
     return text
@@ -298,7 +308,10 @@ def main():
         except OSError as e:
             console.print(f"[dim]session save failed: {e}[/dim]")
 
-    def close_mcp():
+    def shutdown():
+        for name in tools.cleanup_background():
+            console.print(f"  killed background process {name}",
+                          style="dim", markup=False)
         for server in agent.mcp_servers.values():
             server.close()
 
@@ -314,7 +327,7 @@ def main():
             agent.run_turn(expand_mentions(" ".join(args.prompt), console))
         finally:
             save_session()
-            close_mcp()
+            shutdown()
             session_mod.release(state["session_path"])
         sys.exit(1 if agent.had_error else 0)
 
@@ -336,7 +349,7 @@ def main():
     try:
         _repl_loop(session, agent, cfg, state, console, rprompt, save_session)
     finally:
-        close_mcp()
+        shutdown()
         session_mod.release(state["session_path"])
     console.print("[dim]bye[/dim]")
 

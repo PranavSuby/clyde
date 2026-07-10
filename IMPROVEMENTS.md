@@ -63,6 +63,46 @@ fixed in Phase 3 below.
 Still open (deliberately deferred): bare AWS *secret* keys with no key label
 remain unredacted — hard to distinguish a 40-char secret from any base64 blob.
 
+## Phase 5 — Trust-boundary follow-ups (2026-07-08)
+
+1. **`@file` mentions bypassed the redaction net (critical).** `expand_mentions`
+   inlined raw file contents (including `@~/.aws/credentials`) into the user
+   message with no `redact_secrets` pass — shipping them to cloud providers
+   and persisting them in the session file — and `_mark_read` pre-satisfied
+   the edit read-gate even for files outside the workspace. Mention contents
+   are now redacted like every tool result, and only in-workspace mentions
+   mark the file read (no confirmation prompt: the user typed the path, and a
+   later read/edit of an outside file still hits `confirm_outside_read`).
+2. **`glob` leading-wildcard `..` escape (critical).** A pattern with an empty
+   static prefix (`**/../../.ssh/*`) slipped past `outside_workspace`'s
+   prefix check while Python `glob` honored the `..` components, listing
+   files outside the workspace with no prompt. `_glob` now rejects any
+   pattern containing a `..` component (use the `path` argument instead,
+   which goes through the normal boundary check).
+3. **Read-gate completed.** A `read_file(limit=1)` no longer unlocks
+   whole-file edits: partial reads accumulate line ranges and only promote
+   to "read" once they cover the file (the unfinished half of Phase 0.10).
+   And `task` subagent reads no longer pre-satisfy the top-level gate — the
+   main model only saw the report, so it must read the file itself before
+   editing (`_READ_FILES` is snapshot/restored around subagent runs).
+4. **`task`/MCP results are now capped at `max_tool_output_chars`.** They
+   bypassed `tools.execute`, so a verbose or hostile MCP server could blow
+   the context window (and a metered cloud bill) in one call.
+5. **Pure-python `grep` fallback is killable.** A catastrophic-backtracking
+   regex inside `re.search()` can't be interrupted from Python (not even
+   Ctrl-C) and wedged the REPL; the fallback now runs in a spawned child
+   process with the same 60s deadline as the `rg` path.
+6. **Resumed sessions repair dangling `tool_calls`.** A crash between
+   issuing tool calls and saving their results used to 400 on the first
+   resumed request; `session.load` now inserts placeholder tool results.
+7. **Minors:** `atomic_write_json` uses a pid-unique tmp name (config
+   couldn't survive two concurrent `p` answers); filename-prefix path rules
+   no longer cross directory boundaries (`edit_file(config*)` no longer
+   approves `config-backup/secret.py`); background processes are killed and
+   their `clyde-bg-*.log` files removed on exit; `glob` prunes
+   `.git`/`node_modules`/`.venv` during the walk for `**/x` patterns
+   instead of traversing them and discarding matches.
+
 ## Phase 0 — Bug fixes (do before any new features, ~half a day)
 
 1. **Rich markup crash (critical).** Tool headers and approval panels

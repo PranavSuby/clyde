@@ -134,6 +134,69 @@ def test_subagent_read_gate_blocks_outside_workspace(tmp_path, monkeypatch):
     tools.set_workspace(os.getcwd())
 
 
+def test_path_rule_prefix_does_not_cross_directories(tmp_path, monkeypatch):
+    from clyde import tools
+    monkeypatch.setitem(tools._SHELL, "cwd", str(tmp_path))
+    (tmp_path / "config-backup").mkdir()
+    assert config.rule_matches("edit_file(config*)", "edit_file",
+                               {"path": "config-local.py"})
+    # a filename-prefix rule is glob-style: it must not silently approve
+    # files inside a sibling directory that shares the prefix
+    assert not config.rule_matches("edit_file(config*)", "edit_file",
+                                   {"path": "config-backup/secret.py"})
+
+
+def test_subagent_reads_do_not_unlock_main_edit_gate(tmp_path, monkeypatch):
+    from clyde import tools
+    monkeypatch.setitem(tools._SHELL, "cwd", str(tmp_path))
+    tools._READ_FILES.clear()
+    tools._PARTIAL_READS.clear()
+    target = tmp_path / "config.py"
+    target.write_text("x = 1\n")
+    tools.set_workspace(str(tmp_path))
+    a = scripted_agent([
+        [("tool_calls", [{"id": "s1", "name": "read_file",
+                          "arguments": {"path": str(target)}}])],
+        [("text", "found it")],
+    ])
+    a._run_subagent("inspect config.py")
+    # the main model only saw the report, not the file: it must still be
+    # forced to read config.py itself before editing it
+    assert os.path.realpath(str(target)) not in tools._READ_FILES
+    r = tools.execute("edit_file", {"path": str(target),
+                                    "old_string": "x = 1", "new_string": "y"})
+    assert r.startswith("Error: you must read")
+    tools.set_workspace(os.getcwd())
+
+
+def test_mcp_result_truncated(monkeypatch):
+    a = scripted_agent([], cfg={"max_tool_output_chars": 1000}, yolo=True)
+    a._mcp_call = lambda name, args: "x" * 100000
+    a._run_tool({"id": "1", "name": "mcp__srv__tool", "arguments": {}})
+    content = a.messages[-1]["content"]
+    assert len(content) < 2000
+    assert "truncated" in content
+
+
+def test_session_load_repairs_dangling_tool_calls(tmp_path):
+    import json as json_mod
+    path = tmp_path / "s.json"
+    path.write_text(json_mod.dumps({
+        "version": 1, "cwd": str(tmp_path), "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"id": "a", "name": "bash", "arguments": {}},
+                            {"id": "b", "name": "glob", "arguments": {}}]},
+            {"role": "tool", "tool_call_id": "a", "name": "bash",
+             "content": "ok"},
+            # crashed before recording tool result "b"
+        ]}))
+    msgs = session.load(str(path))["messages"]
+    tool_ids = [m.get("tool_call_id") for m in msgs if m["role"] == "tool"]
+    assert tool_ids == ["a", "b"]  # missing result filled with a placeholder
+    assert "interrupted" in msgs[-1]["content"]
+
+
 def test_allow_rule_skips_prompt():
     a = make_agent({"permissions": {"allow": ["bash(git *)"]}})
     assert a.approval.approve("bash", {"command": "git log"}) is True

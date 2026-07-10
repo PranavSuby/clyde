@@ -616,48 +616,59 @@ class Agent:
             {"role": "user", "content": prompt},
         ]
         final_text = ""
-        for _ in range(12):
-            text_parts: list[str] = []
-            tool_calls: list[dict] = []
-            think = ThinkFilter()
-            try:
-                for kind, payload in self.provider.chat(messages, sub_schemas):
-                    if kind == "text":
-                        for fkind, ftext in think.feed(payload):
-                            if fkind == "text":
-                                text_parts.append(ftext)
-                    elif kind == "tool_calls":
-                        tool_calls = payload
-                for fkind, ftext in think.flush():
-                    if fkind == "text":
-                        text_parts.append(ftext)
-            except ProviderError as e:
-                return f"Error: subagent provider error: {e}"
-            final_text = "".join(text_parts).strip()
-            if not tool_calls:
-                break
-            messages.append({"role": "assistant", "content": final_text,
-                             "tool_calls": tool_calls})
-            for tc in tool_calls:
-                self.console.print(
-                    f"  [dim]◐ task → {escape(tc['name'])}"
-                    f"({escape(_args_preview(tc['name'], tc['arguments']))})[/dim]",
-                    highlight=False)
-                if tc["name"] in tools.SUBAGENT_TOOL_NAMES:
-                    # same workspace read boundary as top-level tool calls
-                    outside = tools.outside_workspace(tc["name"], tc["arguments"])
-                    if outside and not self.approval.confirm_outside_read(outside):
-                        result = ("Error: the user denied reading outside "
-                                  "the workspace.")
+        # The subagent's reads must not pre-satisfy the top-level edit
+        # read-gate: only its short report reaches the main model, which
+        # never saw those file contents itself.
+        saved_reads = dict(tools._READ_FILES)
+        saved_partial = dict(tools._PARTIAL_READS)
+        try:
+            for _ in range(12):
+                text_parts: list[str] = []
+                tool_calls: list[dict] = []
+                think = ThinkFilter()
+                try:
+                    for kind, payload in self.provider.chat(messages, sub_schemas):
+                        if kind == "text":
+                            for fkind, ftext in think.feed(payload):
+                                if fkind == "text":
+                                    text_parts.append(ftext)
+                        elif kind == "tool_calls":
+                            tool_calls = payload
+                    for fkind, ftext in think.flush():
+                        if fkind == "text":
+                            text_parts.append(ftext)
+                except ProviderError as e:
+                    return f"Error: subagent provider error: {e}"
+                final_text = "".join(text_parts).strip()
+                if not tool_calls:
+                    break
+                messages.append({"role": "assistant", "content": final_text,
+                                 "tool_calls": tool_calls})
+                for tc in tool_calls:
+                    self.console.print(
+                        f"  [dim]◐ task → {escape(tc['name'])}"
+                        f"({escape(_args_preview(tc['name'], tc['arguments']))})[/dim]",
+                        highlight=False)
+                    if tc["name"] in tools.SUBAGENT_TOOL_NAMES:
+                        # same workspace read boundary as top-level tool calls
+                        outside = tools.outside_workspace(tc["name"], tc["arguments"])
+                        if outside and not self.approval.confirm_outside_read(outside):
+                            result = ("Error: the user denied reading outside "
+                                      "the workspace.")
+                        else:
+                            result = tools.execute(
+                                tc["name"], tc["arguments"],
+                                self.cfg.get("max_tool_output_chars", 12000))
                     else:
-                        result = tools.execute(
-                            tc["name"], tc["arguments"],
-                            self.cfg.get("max_tool_output_chars", 12000))
-                else:
-                    result = "Error: subagents may only use read-only tools"
-                messages.append({"role": "tool", "tool_call_id": tc["id"],
-                                 "name": tc["name"],
-                                 "content": redact_secrets(result)})
+                        result = "Error: subagents may only use read-only tools"
+                    messages.append({"role": "tool", "tool_call_id": tc["id"],
+                                     "name": tc["name"],
+                                     "content": redact_secrets(result)})
+        finally:
+            tools._READ_FILES.clear()
+            tools._READ_FILES.update(saved_reads)
+            tools._PARTIAL_READS.clear()
+            tools._PARTIAL_READS.update(saved_partial)
         return final_text or "(subagent returned nothing)"
 
     def _run_tool(self, tc: dict):
@@ -705,6 +716,10 @@ class Agent:
             if name in ("edit_file", "write_file") \
                     and result.startswith("Error"):
                 self._discard_checkpoint()  # nothing changed; keep /undo honest
+        # task/mcp results bypass tools.execute, so cap them here too — a
+        # verbose (or hostile) MCP server must not blow the context window
+        # in a single call (no-op for built-ins, already capped in execute)
+        result = tools._truncate(result, self.cfg.get("max_tool_output_chars", 12000))
         result = redact_secrets(result)
         all_lines = result.splitlines()
         if name == "bash" and streamed["n"]:

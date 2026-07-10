@@ -46,7 +46,8 @@ redacted from tool results before they enter the conversation.
 
 ## Agentic extras
 
-- `@path/to/file` in a message attaches the file directly (no tool round-trip).
+- `@path/to/file` in a message attaches the file directly (no tool
+  round-trip); the same secret redaction as tool results applies.
 - The model can spawn a **read-only subagent** (`task` tool) for broad
   searches, keeping its own context small — valuable at local context sizes.
 - Long commands stream output live; `run_in_background: true` starts

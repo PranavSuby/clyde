@@ -8,6 +8,7 @@ from clyde import tools
 @pytest.fixture(autouse=True)
 def fresh_state(tmp_path):
     tools._READ_FILES.clear()
+    tools._PARTIAL_READS.clear()
     tools._SHELL["cwd"] = str(tmp_path)
     yield
 
@@ -26,6 +27,23 @@ def test_glob_absolute_pattern_flagged_outside_workspace(tmp_path):
     try:
         assert tools.outside_workspace("glob", {"pattern": "/etc/*"}) == "/etc"
         assert tools.outside_workspace("glob", {"pattern": "*.py"}) is None
+    finally:
+        tools._WORKSPACE["root"] = None
+
+
+def test_glob_rejects_dotdot_components(tmp_path):
+    tools.set_workspace(str(tmp_path))
+    try:
+        # leading wildcard → empty static prefix → outside_workspace can't
+        # flag it, so the tool itself must refuse to walk out of the root
+        pattern = "**/" + "../" * 8 + "etc/*"
+        assert tools.outside_workspace("glob", {"pattern": pattern}) is None
+        out = tools.execute("glob", {"pattern": pattern})
+        assert out.startswith("Error:")
+        assert tools.execute("glob", {"pattern": "../*"}).startswith("Error:")
+        # plain patterns still work
+        (tmp_path / "a.py").write_text("x\n")
+        assert "a.py" in tools.execute("glob", {"pattern": "**/*.py"})
     finally:
         tools._WORKSPACE["root"] = None
 
@@ -51,6 +69,56 @@ def test_read_gate_blocks_unread(tmp_path):
     r = tools.execute("edit_file", {"path": str(p), "old_string": "hello",
                                     "new_string": "bye"})
     assert r.startswith("Error: you must read")
+
+
+def test_read_gate_partial_read_does_not_unlock(tmp_path):
+    p = tmp_path / "f.txt"
+    p.write_text("".join(f"line{i}\n" for i in range(10)))
+    tools.execute("read_file", {"path": str(p), "limit": 1})
+    r = tools.execute("edit_file", {"path": str(p), "old_string": "line9",
+                                    "new_string": "x"})
+    assert r.startswith("Error: you have only read lines 1-1")
+    # chunked reads that eventually cover the whole file do unlock it
+    tools.execute("read_file", {"path": str(p), "offset": 2, "limit": 4})
+    tools.execute("read_file", {"path": str(p), "offset": 6, "limit": 100})
+    r = tools.execute("edit_file", {"path": str(p), "old_string": "line9",
+                                    "new_string": "x"})
+    assert "Replaced" in r
+
+
+def test_grep_fallback_timeout_on_catastrophic_regex(tmp_path, monkeypatch):
+    (tmp_path / "bomb.txt").write_text("a" * 40 + "!\n")
+    monkeypatch.setattr(tools.shutil, "which", lambda _: None)  # force fallback
+    monkeypatch.setattr(tools, "_GREP_TIMEOUT", 1)
+    r = tools.execute("grep", {"pattern": "(a+)+$", "path": str(tmp_path)})
+    assert "timed out" in r
+    # normal fallback searches still work
+    r = tools.execute("grep", {"pattern": "a+!", "path": str(tmp_path)})
+    assert "bomb.txt" in r
+
+
+def test_cleanup_background_kills_and_removes_logs(tmp_path):
+    out = tools.execute("bash", {"command": "sleep 60",
+                                 "run_in_background": True})
+    assert "Started background process" in out
+    bg = next(iter(tools._BG_PROCS.values()))
+    log = bg["log"]
+    killed = tools.cleanup_background()
+    assert killed and "sleep 60" in killed[0]
+    assert bg["proc"].poll() is not None
+    assert not os.path.exists(log)
+    assert not tools._BG_PROCS
+
+
+def test_glob_prunes_skip_dirs(tmp_path):
+    (tmp_path / "node_modules" / "pkg").mkdir(parents=True)
+    (tmp_path / "node_modules" / "pkg" / "x.py").write_text("x\n")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("x\n")
+    (tmp_path / "top.py").write_text("x\n")
+    out = tools.execute("glob", {"pattern": "**/*.py"})
+    assert "src/a.py" in out and "top.py" in out
+    assert "node_modules" not in out
 
 
 def test_read_gate_staleness(tmp_path):

@@ -276,7 +276,9 @@ def outside_workspace(name: str, args: dict) -> str | None:
             # an absolute pattern ignores the path arg entirely
             raw = static or "/"
         elif static:
-            # a relative pattern can still climb out via ".." components
+            # a relative pattern can still climb out via ".." components;
+            # ones hidden behind a leading wildcard (empty static prefix)
+            # are rejected outright in _glob
             raw = os.path.join(str(raw), static)
     target = os.path.realpath(_resolve(str(raw)))
     home_cfg = os.path.realpath(os.path.expanduser("~/.config/clyde"))
@@ -287,10 +289,16 @@ def outside_workspace(name: str, args: dict) -> str | None:
 
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".cache", "dist", "build"}
 
-# Files the model has read this session (realpath -> mtime at read time).
-# Editing an existing file it hasn't read — or one modified since the read —
-# is rejected so the model can't apply blind edits.
+# Files the model has read *in full* this session (realpath -> mtime at read
+# time). Editing an existing file it hasn't fully read — or one modified
+# since the read — is rejected so the model can't apply blind edits.
 _READ_FILES: dict[str, float] = {}
+
+# Line ranges seen so far of files only partially read
+# (realpath -> (mtime, merged sorted [(start, end)] 1-based inclusive)).
+# Once the ranges cover the whole file it is promoted to _READ_FILES;
+# a partial read alone must not unlock whole-file edits.
+_PARTIAL_READS: dict[str, tuple[float, list[tuple[int, int]]]] = {}
 
 
 def _mark_read(path: str):
@@ -299,6 +307,30 @@ def _mark_read(path: str):
         _READ_FILES[rp] = os.stat(rp).st_mtime
     except OSError:
         pass
+    _PARTIAL_READS.pop(rp, None)
+
+
+def _note_read_range(path: str, start: int, end: int, total: int):
+    """Record a partial read; promote to fully-read once the accumulated
+    ranges cover every line of the (unchanged) file."""
+    rp = os.path.realpath(path)
+    try:
+        mtime = os.stat(rp).st_mtime
+    except OSError:
+        return
+    prev_mtime, ranges = _PARTIAL_READS.get(rp, (mtime, []))
+    if prev_mtime != mtime:
+        ranges = []  # file changed under us: earlier chunks are stale
+    merged: list[tuple[int, int]] = []
+    for lo, hi in sorted(ranges + [(start, end)]):
+        if merged and lo <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+    if merged and merged[0][0] <= 1 and merged[0][1] >= total:
+        _mark_read(path)
+    else:
+        _PARTIAL_READS[rp] = (mtime, merged)
 
 
 def _check_read_gate(path: str) -> str | None:
@@ -307,6 +339,10 @@ def _check_read_gate(path: str) -> str | None:
     if not os.path.exists(rp):
         return None  # new file: no gate
     if rp not in _READ_FILES:
+        if rp in _PARTIAL_READS:
+            seen = ", ".join(f"{lo}-{hi}" for lo, hi in _PARTIAL_READS[rp][1])
+            return (f"Error: you have only read lines {seen} of this file. "
+                    "Read the rest of it before editing.")
         return "Error: you must read this file with read_file before editing it."
     try:
         if os.stat(rp).st_mtime != _READ_FILES[rp]:
@@ -502,6 +538,30 @@ def _bash_output(args: dict) -> str:
     return f"[{bg['command']}] {status}\n{tail or '(no output yet)'}"
 
 
+def cleanup_background() -> list[str]:
+    """Kill still-running background processes and remove their log files.
+
+    Called when clyde exits: after that there is no bash_output/bash_kill
+    left to manage them with, so anything still running is just an orphan
+    and every log is a leaked temp file."""
+    killed = []
+    for bg_id, bg in list(_BG_PROCS.items()):
+        proc = bg["proc"]
+        if proc.poll() is None:
+            _kill_group(proc)
+            killed.append(f"#{bg_id} ({bg['command']})")
+        try:
+            proc.wait(timeout=5)  # reap; the group is already SIGKILLed
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        try:
+            os.unlink(bg["log"])
+        except OSError:
+            pass
+        del _BG_PROCS[bg_id]
+    return killed
+
+
 def _bash_kill(args: dict) -> str:
     bg = _BG_PROCS.get(int(args.get("id", 0)))
     if not bg:
@@ -518,10 +578,16 @@ def _read_file(args: dict) -> str:
     limit = int(args.get("limit") or 1000)
     with open(path, "r", errors="replace") as f:
         lines = f.readlines()
-    _mark_read(path)
     if not lines:
+        _mark_read(path)
         return "(empty file)"
     chunk = lines[offset - 1 : offset - 1 + limit]
+    if chunk:
+        end = offset - 1 + len(chunk)
+        if offset <= 1 and end >= len(lines):
+            _mark_read(path)  # whole file seen in one call
+        else:
+            _note_read_range(path, offset, end, len(lines))
     numbered = [f"{i}: {line.rstrip(chr(10))}" for i, line in enumerate(chunk, start=offset)]
     result = "\n".join(numbered)
     remaining = len(lines) - (offset - 1 + len(chunk))
@@ -593,8 +659,33 @@ def _list_dir(args: dict) -> str:
 
 
 def _glob(args: dict) -> str:
+    pattern = str(args["pattern"])
+    # A ".." component walks out of root_dir even when a wildcard hides it
+    # from the static-prefix check in outside_workspace ("**/../../.ssh/*"),
+    # so it would list files outside the workspace with no prompt.
+    if ".." in pattern.replace("\\", "/").split("/"):
+        return ("Error: glob patterns may not contain '..' components. "
+                "Pass the directory to search in the 'path' argument instead.")
     root = _resolve(args.get("path") or ".")
-    matches = globmod.glob(args["pattern"], root_dir=root, recursive=True)
+    rest = pattern[3:] if pattern.startswith("**/") else None
+    if rest and "/" not in rest and "**" not in rest:
+        # the common recursive case (`**/*.py`): walk with SKIP_DIRS pruned
+        # instead of letting glob() traverse .git/node_modules/.venv fully
+        # and discarding those matches afterwards
+        matches = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            # glob's `*` never matches hidden entries, so skip them too
+            dirnames[:] = [d for d in dirnames
+                           if d not in SKIP_DIRS and not d.startswith(".")]
+            relbase = os.path.relpath(dirpath, root)
+            for name in filenames + dirnames:
+                if name.startswith(".") and not rest.startswith("."):
+                    continue
+                if fnmatch.fnmatch(name, rest):
+                    matches.append(name if relbase == "."
+                                   else os.path.join(relbase, name))
+    else:
+        matches = globmod.glob(pattern, root_dir=root, recursive=True)
     matches = [
         # join with root so results resolve correctly from the shell cwd
         os.path.join(root, m) if root != (_SHELL["cwd"] or os.getcwd()) else m
@@ -611,6 +702,9 @@ def _glob(args: dict) -> str:
     return result
 
 
+_GREP_TIMEOUT = 60
+
+
 def _grep(args: dict) -> str:
     pattern = args["pattern"]
     path = _resolve(args.get("path") or ".")
@@ -623,14 +717,50 @@ def _grep(args: dict) -> str:
         if include:
             cmd += ["--glob", include]
         cmd.append(path)
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=_GREP_TIMEOUT)
         if proc.returncode == 1:
             return "(no matches)"
         if proc.returncode not in (0, 1):
             return f"Error: {proc.stderr.strip()}"
         return proc.stdout.strip()
 
-    # Fallback: pure-python search
+    # Fallback: pure-python search, in a child process we can kill — a
+    # catastrophic-backtracking pattern stuck inside re.search() cannot be
+    # interrupted from Python (not even by Ctrl-C) and would wedge the REPL.
+    import multiprocessing
+    import queue as queue_mod
+    import re
+    re.compile(pattern)  # surface a bad pattern as an immediate error
+    # spawn, not fork: the REPL runs helper threads (bash readers/timers),
+    # and forking a multi-threaded process can deadlock the child
+    ctx = multiprocessing.get_context("spawn")
+    q = ctx.Queue()
+    child = ctx.Process(target=_grep_child, args=(q, pattern, path, include),
+                        daemon=True)
+    child.start()
+    try:
+        return q.get(timeout=_GREP_TIMEOUT)
+    except queue_mod.Empty:
+        return (f"Error: search timed out after {_GREP_TIMEOUT}s. "
+                "Try a simpler pattern or a narrower path.")
+    finally:
+        if child.is_alive():
+            child.terminate()
+            child.join(5)
+        if child.is_alive():
+            child.kill()
+        child.join(5)
+
+
+def _grep_child(q, pattern: str, path: str, include: str | None):
+    try:
+        q.put(_grep_python(pattern, path, include))
+    except Exception as e:  # noqa: BLE001 — must reach the parent as a string
+        q.put(f"Error: {type(e).__name__}: {e}")
+
+
+def _grep_python(pattern: str, path: str, include: str | None) -> str:
     import re
     rx = re.compile(pattern)
     results = []

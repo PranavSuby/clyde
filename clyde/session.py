@@ -76,12 +76,44 @@ def list_sessions(cwd: str | None = None, limit: int = 10) -> list[dict]:
     return out[:limit]
 
 
+def _repair_tool_pairing(messages: list) -> list:
+    """Fill in tool results a crash left missing.
+
+    Dying between issuing tool calls and recording their results leaves an
+    assistant `tool_calls` message with no matching `tool` replies; OpenAI-
+    compatible providers then 400 on the very first resumed request. Insert
+    placeholder results so the history stays well-formed."""
+    out: list = []
+    pending: list = []  # tool calls still awaiting a result message
+    placeholder = ("(clyde was interrupted before this tool call finished; "
+                   "its result was lost)")
+
+    def flush_pending():
+        for tc in pending:
+            out.append({"role": "tool", "tool_call_id": tc.get("id"),
+                        "name": tc.get("name", ""), "content": placeholder})
+        pending.clear()
+
+    for msg in messages:
+        if msg.get("role") == "tool":
+            pending[:] = [tc for tc in pending
+                          if tc.get("id") != msg.get("tool_call_id")]
+        else:
+            flush_pending()
+            if msg.get("role") == "assistant":
+                pending.extend(msg.get("tool_calls") or [])
+        out.append(msg)
+    flush_pending()
+    return out
+
+
 def load(path: str) -> dict:
     """Load a session file. Raises OSError or ValueError if unusable."""
     with open(path) as f:
         data = json.load(f)
     if not _valid(data):
         raise ValueError(f"{path} is not a clyde session file")
+    data["messages"] = _repair_tool_pairing(data["messages"])
     return data
 
 

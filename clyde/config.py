@@ -78,8 +78,10 @@ def deep_merge(base: dict, override: dict) -> dict:
 
 
 def atomic_write_json(path: str, data: dict):
-    """Write JSON via a temp file + rename, so a crash can't truncate it."""
-    tmp = path + ".tmp"
+    """Write JSON via a temp file + rename, so a crash can't truncate it.
+    The tmp name is pid-unique: two processes persisting at once (e.g. both
+    answering `p` to an approval) must not interleave into one tmp file."""
+    tmp = f"{path}.{os.getpid()}.tmp"
     with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
     os.replace(tmp, path)
@@ -159,7 +161,11 @@ def rule_matches(rule: str, name: str, args: dict) -> bool:
         # literal filename prefix (`src/foo*`)
         if base.endswith(os.sep) or base.endswith("/"):
             return target == prefix or target.startswith(prefix + os.sep)
-        return target.startswith(prefix)
+        # filename prefix (`src/foo*`): glob-style, so it must not cross a
+        # separator — `config*` approves config-local.py, not the contents
+        # of a sibling config-backup/ directory
+        return target.startswith(prefix) \
+            and os.sep not in target[len(prefix):]
     return target == os.path.realpath(tools._resolve(pattern))
 
 
