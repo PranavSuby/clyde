@@ -71,6 +71,20 @@ class ApprovalPolicy:
             return True
         return answer in ("y", "yes")
 
+    def confirm_exfil(self, name: str, detail: str) -> bool:
+        """Exfiltration guard confirmation. Unlike normal approval this fires
+        even under --yolo and even for allow-ruled tools: sending read data or a
+        credential to an outbound tool is exactly the case a blanket 'yes'
+        should not cover. Silence / no TTY (EOFError) means block."""
+        try:
+            answer = self.console.input(
+                f"[red]⚠ possible exfiltration:[/red] {escape(name)} would send "
+                f"{escape(detail)} to an outbound tool. Allow? \\[y/N] "
+            ).strip().lower()
+        except (EOFError, OSError):
+            return False  # no interactive TTY → fail closed (block)
+        return answer in ("y", "yes")
+
     def confirm_outside_read(self, path: str) -> bool:
         """Extra confirmation for reads that leave the workspace."""
         if self.yolo:

@@ -3,6 +3,7 @@
 import fnmatch
 import glob as globmod
 import os
+import re
 import shutil
 import subprocess
 
@@ -300,6 +301,54 @@ _READ_FILES: dict[str, float] = {}
 # a partial read alone must not unlock whole-file edits.
 _PARTIAL_READS: dict[str, tuple[float, list[tuple[int, int]]]] = {}
 
+# Provenance / taint: high-entropy tokens the model has READ from files this
+# session. Redaction protects secrets *inbound* (in tool results) but only for
+# values that match a known pattern; an opaque token matches nothing and would
+# otherwise flow verbatim into an outbound tool argument. Tracking provenance
+# catches exactly that: if a substantial token that came from a read shows up
+# in an outbound bash/MCP argument, it's a likely exfiltration. See the exfil
+# guard in agent._run_tool.
+_TAINT_TOKENS: set[str] = set()
+_TAINT_MAX = 4000  # cap the set so a huge read can't grow it without bound
+
+# token candidates: >=12 chars from the "identifier/secret" alphabet.
+# '=' is excluded on purpose so KEY=VALUE splits into KEY and VALUE (we want to
+# track the value, not the whole assignment); base64 bodies still match without
+# their trailing '=' padding.
+_TOKEN_RE = re.compile(r"[A-Za-z0-9_\-./+]{12,}")
+
+
+def _looks_secretish(tok: str) -> bool:
+    """A token worth tracking as provenance: high-entropy enough to be a
+    credential, not an ordinary word or file path. Mixed case + a digit, or
+    very long, and not a pure path/dotted-name."""
+    if tok.count("/") >= 2 or tok.count(".") >= 2:
+        return False  # path or dotted identifier — too FP-prone to taint
+    has_digit = any(c.isdigit() for c in tok)
+    has_upper = any(c.isupper() for c in tok)
+    has_lower = any(c.islower() for c in tok)
+    return (has_digit and has_upper and has_lower) or len(tok) >= 24
+
+
+def record_read_taint(text: str):
+    """Remember the high-entropy tokens in content the model just read."""
+    if len(_TAINT_TOKENS) >= _TAINT_MAX:
+        return
+    for tok in _TOKEN_RE.findall(text or ""):
+        if _looks_secretish(tok):
+            _TAINT_TOKENS.add(tok)
+            if len(_TAINT_TOKENS) >= _TAINT_MAX:
+                break
+
+
+def tainted_hits(text: str) -> list[str]:
+    """Tokens from read-content that appear verbatim in `text` (e.g. an
+    outbound command). A non-empty result means read data is leaving via an
+    argument."""
+    if not text:
+        return []
+    return sorted(t for t in _TAINT_TOKENS if t in text)
+
 
 def _mark_read(path: str):
     rp = os.path.realpath(path)
@@ -588,6 +637,7 @@ def _read_file(args: dict) -> str:
             _mark_read(path)  # whole file seen in one call
         else:
             _note_read_range(path, offset, end, len(lines))
+    record_read_taint("".join(chunk))  # provenance for the exfil guard
     numbered = [f"{i}: {line.rstrip(chr(10))}" for i, line in enumerate(chunk, start=offset)]
     result = "\n".join(numbered)
     remaining = len(lines) - (offset - 1 + len(chunk))

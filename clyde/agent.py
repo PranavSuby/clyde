@@ -264,6 +264,7 @@ class Agent:
         ]
         self.last_usage = {}
         tools._READ_FILES.clear()
+        tools._TAINT_TOKENS.clear()
 
     def _context_size(self) -> int | None:
         """The window we're budgeting against, for any provider type."""
@@ -591,6 +592,40 @@ class Agent:
                        f"to {path} was reverted]",
         })
 
+    def _exfil_guard(self, name: str, args: dict) -> str | None:
+        """Provenance-based egress check for outbound tools (bash / MCP).
+
+        Redaction protects secrets *inbound* and only for known patterns; this
+        catches the other direction. If an outbound argument carries either
+        (a) a high-entropy token the model READ from a file this session
+        (provenance — catches opaque secrets no regex knows), or (b) a value
+        matching a secret pattern (defence in depth), require an explicit
+        confirmation — even under --yolo. Returns an error string to feed the
+        model when the call is blocked, else None."""
+        if not self.cfg.get("exfil_guard", True):
+            return None
+        if name != "bash" and not name.startswith("mcp__"):
+            return None
+        blob = args.get("command", "") if name == "bash" \
+            else json.dumps(args, ensure_ascii=False)
+        hits = tools.tainted_hits(blob)
+        pattern_leak = redact_secrets(blob) != blob
+        if not hits and not pattern_leak:
+            return None
+        reasons = []
+        if hits:
+            reasons.append(f"{len(hits)} value(s) read from a file this session")
+        if pattern_leak:
+            reasons.append("a credential matching a secret pattern")
+        detail = " and ".join(reasons)
+        if self.approval.confirm_exfil(name, detail):
+            return None  # user explicitly allowed this egress
+        return ("Error: blocked by the exfiltration guard — this "
+                f"{'command' if name == 'bash' else 'call'} would send "
+                f"{detail} to an outbound tool, which the user did not "
+                "request. Do not retry; if the user intended this, they must "
+                "confirm it.")
+
     def _mcp_call(self, name: str, args: dict) -> str:
         from .mcp import MCPError
         _, server_name, tool_name = name.split("__", 2)
@@ -697,12 +732,19 @@ class Agent:
             if approved and outside:
                 approved = self.approval.confirm_outside_read(outside)
 
+        exfil_block = None
+        if approved and not malformed:
+            exfil_block = self._exfil_guard(name, args)
+
         if malformed:
             result = malformed
             self.console.print("[red]  malformed arguments[/red]")
         elif not approved:
             result = "Error: user denied this tool call. Ask before retrying."
             self.console.print("[red]  denied[/red]")
+        elif exfil_block:
+            result = exfil_block
+            self.console.print("[red]  blocked by exfiltration guard[/red]")
         elif name == "task":
             result = self._run_subagent(str(args.get("prompt", "")))
         elif name.startswith("mcp__"):
@@ -807,6 +849,7 @@ class Agent:
              "content": "Understood. Continuing from that summary."},
         ]
         tools._READ_FILES.clear()  # file contents are no longer in context
+        tools._TAINT_TOKENS.clear()
         self.last_usage = {}
         self.console.print("[dim]History compacted.[/dim]")
 
