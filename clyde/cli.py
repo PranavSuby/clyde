@@ -21,13 +21,13 @@ from rich.markup import escape
 
 from . import __version__, config, tools
 from . import session as session_mod
-from .agent import Agent, build_system_prompt, redact_secrets, spotlight
+from .agent import Agent, redact_secrets, spotlight
 from .providers import ProviderError, ensure_ollama_running, make_provider
 
 _MENTION_RE = re.compile(r"@([~\w./\\-]+)")
 
 
-def expand_mentions(text: str, console: Console, agent: "Agent | None" = None) -> str:
+def expand_mentions(text: str, console: Console, agent: Agent | None = None) -> str:
     """Inline @path mentions: append file contents so the model doesn't
     need a read_file round-trip (expensive on slow local models)."""
     blocks = []
@@ -114,9 +114,19 @@ def _apply_resumed_session(agent, data, cfg, state, console,
     system prompt for the *current* cwd, warn on a cwd mismatch, and restore
     the session's saved profile/model unless overridden on the CLI."""
     agent.messages = data["messages"]
+    # A resumed transcript can carry untrusted tool output (and injected
+    # instructions) from the prior session. Re-arm the taint gate from it, or a
+    # mutation the injection steers would auto-approve under --yolo/allow-rule
+    # after resume. Key off tool name, not the spotlight marker: a session
+    # saved with spotlight_tool_results=False has untrusted output but no marker.
+    agent.untrusted_seen = any(
+        m.get("role") == "tool"
+        and (m.get("name") in tools.UNTRUSTED_SOURCE_TOOLS
+             or str(m.get("name") or "").startswith("mcp__"))
+        for m in agent.messages)
     # tools resolve paths against the current cwd, so the system prompt must
     # describe the current cwd — not the (stale) one saved in the transcript
-    fresh = {"role": "system", "content": build_system_prompt(agent.cwd)}
+    fresh = {"role": "system", "content": agent._system_prompt()}
     if agent.messages and agent.messages[0].get("role") == "system":
         agent.messages[0] = fresh
     else:

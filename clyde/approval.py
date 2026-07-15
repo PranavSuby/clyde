@@ -52,14 +52,18 @@ class ApprovalPolicy:
                   and self.cfg.get("taint_reapproval", True)
                   and (name in tools.MUTATING_TOOLS
                        or name.startswith("mcp__")))
-        if self.yolo or not needs_approval:
+
+        def grant():  # auto-approve — but re-confirm first if tainted
             return self._confirm_tainted(name, preview) if regate else True
+
+        if self.yolo or not needs_approval:
+            return grant()
         for rule in self.session_allow:
             if config_mod.rule_matches(rule, name, args):
-                return self._confirm_tainted(name, preview) if regate else True
+                return grant()
         for rule in self.cfg.get("permissions", {}).get("allow", []):
             if config_mod.rule_matches(rule, name, args):
-                return self._confirm_tainted(name, preview) if regate else True
+                return grant()
         if preview is not None:
             preview()
         rule = self.rule_for(name, args)

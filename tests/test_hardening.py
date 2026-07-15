@@ -267,3 +267,52 @@ def test_mcp_call_time_allowlist():
     assert out.startswith("Error") and "allow list" in out
     assert server.calls == []
     assert a._mcp_call("mcp__srv__safe", {}) == "ok"
+
+
+# --- taint survives session resume ------------------------------------------
+
+def _resume(agent, messages, cfg=None):
+    from clyde import cli
+    data = {"messages": messages, "profile": "p", "model": "m"}
+    cli._apply_resumed_session(
+        agent, data, cfg or {}, {"profile": "p", "model": "m"},
+        Console(file=open(os.devnull, "w")), explicit_profile=True)
+
+
+def test_resume_rearms_taint_from_transcript():
+    a = _agent([])
+    assert not a.untrusted_seen
+    _resume(a, [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "read the file"},
+        {"role": "tool", "name": "read_file", "content": "poisoned"},
+        {"role": "assistant", "content": "ok"},
+    ])
+    assert a.untrusted_seen  # prior untrusted tool output → gate re-armed
+
+
+def test_resume_clean_transcript_leaves_untainted():
+    a = _agent([])
+    _resume(a, [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+    ])
+    assert not a.untrusted_seen
+
+
+def test_resume_rearms_taint_from_mcp_result():
+    a = _agent([])
+    _resume(a, [
+        {"role": "user", "content": "x"},
+        {"role": "tool", "name": "mcp__srv__lookup", "content": "data"},
+    ])
+    assert a.untrusted_seen
+
+
+def test_resume_uses_config_aware_system_prompt():
+    # the agent's own config drives the rebuilt prompt (not the default)
+    a = _agent([], cfg={"spotlight_tool_results": False})
+    _resume(a, [{"role": "user", "content": "hi"}])
+    # spotlight disabled → resumed system prompt must not carry the rule
+    assert "untrusted_tool_output" not in a.messages[0]["content"]

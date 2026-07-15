@@ -280,12 +280,11 @@ class Agent:
             {"role": "system", "content": self._system_prompt()}
         ]
 
-    def _system_prompt(self) -> str:
-        return build_system_prompt(
-            self.cwd, self.cfg.get("spotlight_tool_results", True))
-
     def _spotlight_enabled(self) -> bool:
         return bool(self.cfg.get("spotlight_tool_results", True))
+
+    def _system_prompt(self) -> str:
+        return build_system_prompt(self.cwd, self._spotlight_enabled())
 
     @property
     def yolo(self) -> bool:
@@ -819,7 +818,7 @@ class Agent:
                     or name.startswith("mcp__")):
             self.untrusted_seen = True
             if self._spotlight_enabled():
-                content = spotlight(result)
+                content = spotlight(content)
         all_lines = result.splitlines()
         if name == "bash" and streamed["n"]:
             shown = []  # already printed live

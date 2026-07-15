@@ -457,9 +457,13 @@ _CWD_MARKER = "__CLYDE_CWD__"
 # touching a file, bypassing both redaction and the read-taint exfil guard.
 # Variables whose NAME looks credential-bearing are dropped; everything else
 # (PATH, HOME, VIRTUAL_ENV, ...) passes through so dev tooling keeps working.
+# Includes bare `*_KEY` / `KEY_*` (OPENROUTER_KEY, STRIPE_KEY), webhook URLs,
+# and connection strings that embed a password (DATABASE_URL, *_DSN). This
+# over-scrubs occasionally; bash_env_keep is the escape hatch.
 _ENV_SENSITIVE = re.compile(
-    r"(?i)(api[_-]?key|apikey|secret|token|passw|credential"
-    r"|private[_-]?key|access[_-]?key)")
+    r"(?i)(secret|token|passw|credential|api[_-]?key|apikey"
+    r"|access[_-]?key|private[_-]?key|(^|_)key(_|$)|webhook"
+    r"|database_url|_dsn(_|$)|(^|_)dsn(_|$))")
 _ENV_POLICY = {"scrub": True, "keep": frozenset()}
 
 
