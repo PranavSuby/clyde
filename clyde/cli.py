@@ -21,13 +21,13 @@ from rich.markup import escape
 
 from . import __version__, config, tools
 from . import session as session_mod
-from .agent import Agent, build_system_prompt, redact_secrets
+from .agent import Agent, build_system_prompt, redact_secrets, spotlight
 from .providers import ProviderError, ensure_ollama_running, make_provider
 
 _MENTION_RE = re.compile(r"@([~\w./\\-]+)")
 
 
-def expand_mentions(text: str, console: Console) -> str:
+def expand_mentions(text: str, console: Console, agent: "Agent | None" = None) -> str:
     """Inline @path mentions: append file contents so the model doesn't
     need a read_file round-trip (expensive on slow local models)."""
     blocks = []
@@ -58,9 +58,15 @@ def expand_mentions(text: str, console: Console) -> str:
         if outside is None:
             tools._mark_read(path)  # mentioned file may be edited without re-read
         note = " · outside workspace" if outside else ""
+        # attached file content is exactly as untrusted as a read_file result:
+        # spotlight it and flip the taint flag so mutations re-gate
+        if agent is not None and agent.cfg.get("spotlight_tool_results", True):
+            content = spotlight(content)
         blocks.append(f"--- {raw} ---\n{content}")
         console.print(f"[dim]attached {raw} ({len(content)} chars){note}[/dim]")
     if blocks:
+        if agent is not None:
+            agent.untrusted_seen = True
         return text + "\n\nAttached files:\n" + "\n\n".join(blocks)
     return text
 
@@ -324,7 +330,7 @@ def main():
             )
             sys.exit(2)
         try:
-            agent.run_turn(expand_mentions(" ".join(args.prompt), console))
+            agent.run_turn(expand_mentions(" ".join(args.prompt), console, agent))
         finally:
             save_session()
             shutdown()
@@ -369,7 +375,7 @@ def _repl_loop(session, agent, cfg, state, console, rprompt, save_session):
                 if not _handle_slash(line, agent, cfg, state, console):
                     break
             else:
-                agent.run_turn(expand_mentions(line, console))
+                agent.run_turn(expand_mentions(line, console, agent))
         except KeyboardInterrupt:
             console.print("\n[yellow]Interrupted.[/yellow]")
         except Exception as e:  # never lose the session to a bug

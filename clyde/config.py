@@ -51,6 +51,21 @@ DEFAULT_CONFIG = {
         "elan_bin": "~/.elan/bin",
         "timeout": 90,
     },
+    # Injection / egress defenses (see INJECTION_EVAL.md):
+    # spotlight_tool_results — wrap tool output in <untrusted_tool_output>
+    #   delimiters plus a system-prompt rule that it is data, not instructions.
+    # taint_reapproval — once untrusted tool output has entered the context,
+    #   mutating tools (bash/edit/write/MCP) need explicit confirmation even
+    #   under --yolo or an allow rule ('a' at the prompt disables per session).
+    # exfil_guard — confirm outbound commands carrying values read from files
+    #   or credential-shaped strings.
+    # scrub_bash_env — drop credential-named env vars (API keys, tokens) from
+    #   bash subprocess environments; bash_env_keep lists exceptions to keep.
+    "spotlight_tool_results": True,
+    "taint_reapproval": True,
+    "exfil_guard": True,
+    "scrub_bash_env": True,
+    "bash_env_keep": [],
     "auto_start_ollama": True,
     "max_tool_output_chars": 12000,
     "max_iterations": 40,

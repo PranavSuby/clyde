@@ -9,6 +9,15 @@ dependencies = [
     "prompt_toolkit>=3.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "hypothesis>=6",
+    "ruff>=0.4",
+    "bandit>=1.7",
+    "pip-audit>=2.7",
+]
+
 [project.scripts]
 clyde = "clyde.cli:main"
 

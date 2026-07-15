@@ -232,7 +232,7 @@ def test_run_turn_denied_tool_records_error():
         [("tool_calls", [tc]), ("usage", {})],
         [("text", "ok"), ("usage", {})],
     ], yolo=False)
-    a.approval.approve = lambda name, args, preview=None: False
+    a.approval.approve = lambda name, args, preview=None, tainted=False: False
     a.run_turn("run")
     tool_msg = next(m for m in a.messages if m["role"] == "tool")
     assert tool_msg["content"].startswith("Error: user denied")

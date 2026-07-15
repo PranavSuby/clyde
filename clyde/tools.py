@@ -253,6 +253,18 @@ TOOL_SCHEMAS = [
 # Tools that mutate state and need user approval (unless --yolo).
 APPROVAL_REQUIRED = {"bash", "write_file", "edit_file"}
 
+# Tools whose results carry content clyde did not write itself (file
+# contents, command output, subagent reports). Once any of these has entered
+# the context, injected instructions may be steering the model — the taint
+# re-approval gate keys off this set. MCP tools count too (checked by prefix).
+UNTRUSTED_SOURCE_TOOLS = {"read_file", "bash", "bash_output", "grep", "glob",
+                          "list_dir", "task"}
+
+# Tools that change state outside the conversation; these are what an
+# injection must reach to do damage, so they are the ones re-gated after
+# untrusted content has been ingested.
+MUTATING_TOOLS = {"bash", "edit_file", "write_file"}
+
 # Read-only tools a subagent may use freely.
 SUBAGENT_TOOL_NAMES = {"read_file", "list_dir", "glob", "grep"}
 
@@ -439,6 +451,30 @@ def execute(name: str, args: dict, max_chars: int = 12000, on_line=None) -> str:
 _SHELL = {"cwd": None}
 _CWD_MARKER = "__CLYDE_CWD__"
 
+# Tool subprocesses must not inherit credentials. The parent environment is
+# where provider API keys live (see api_key_env in profiles), so any bash
+# call — or an injected `printenv | curl ...` — could read them without
+# touching a file, bypassing both redaction and the read-taint exfil guard.
+# Variables whose NAME looks credential-bearing are dropped; everything else
+# (PATH, HOME, VIRTUAL_ENV, ...) passes through so dev tooling keeps working.
+_ENV_SENSITIVE = re.compile(
+    r"(?i)(api[_-]?key|apikey|secret|token|passw|credential"
+    r"|private[_-]?key|access[_-]?key)")
+_ENV_POLICY = {"scrub": True, "keep": frozenset()}
+
+
+def set_env_policy(cfg: dict):
+    _ENV_POLICY["scrub"] = bool(cfg.get("scrub_bash_env", True))
+    _ENV_POLICY["keep"] = frozenset(cfg.get("bash_env_keep") or [])
+
+
+def subprocess_env() -> dict | None:
+    """Environment for tool subprocesses (None = inherit unchanged)."""
+    if not _ENV_POLICY["scrub"]:
+        return None
+    return {k: v for k, v in os.environ.items()
+            if k in _ENV_POLICY["keep"] or not _ENV_SENSITIVE.search(k)}
+
 
 def _resolve(path: str) -> str:
     """Expand ~ and resolve relative paths against the persistent shell cwd."""
@@ -478,7 +514,7 @@ def _bash(args: dict, on_line=None) -> str:
         proc = subprocess.Popen(
             ["bash", "-c", f"cd {shlex.quote(cwd)} 2>/dev/null\n{args['command']}"],
             stdout=log, stderr=subprocess.STDOUT, text=True,
-            start_new_session=True,
+            start_new_session=True, env=subprocess_env(),
         )
         log.close()  # the child holds its own handle
         bg_id = _BG_NEXT_ID[0]
@@ -497,6 +533,7 @@ def _bash(args: dict, on_line=None) -> str:
         ["bash", "-c", wrapped],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         start_new_session=True,  # own process group: timeouts kill children too
+        env=subprocess_env(),
     )
     timed_out = threading.Event()
 

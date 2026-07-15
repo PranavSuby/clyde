@@ -20,6 +20,9 @@ class ApprovalPolicy:
         # session-scoped allow rules ("bash(git *)", "edit_file"), matched
         # with the same semantics as persisted permission rules
         self.session_allow: set[str] = set()
+        # 'a' answer to the taint re-approval prompt: the user has decided to
+        # trust content ingested this session, stop re-gating mutations
+        self.taint_trusted = False
 
     @staticmethod
     def rule_for(name: str, args: dict) -> str:
@@ -29,22 +32,34 @@ class ApprovalPolicy:
             return f"bash({first} *)"
         return name
 
-    def approve(self, name: str, args: dict, preview=None) -> bool:
+    def approve(self, name: str, args: dict, preview=None,
+                tainted: bool = False) -> bool:
         """True if this tool call may run, prompting the user if needed.
 
         `preview` (optional callable) is invoked just before the prompt to
         show the user what the call would change.
+
+        `tainted` means untrusted tool output has entered the context this
+        session. Auto-approval paths (--yolo, allow rules) then no longer
+        cover mutating tools: an injected instruction that survives the
+        model must still get past an explicit human confirmation. Measured
+        in the injection eval: this is what takes *executed* attack success
+        to 0% even under --yolo.
         """
         needs_approval = name in tools.APPROVAL_REQUIRED \
             or name.startswith("mcp__")  # MCP tools may have side effects
+        regate = (tainted and not self.taint_trusted
+                  and self.cfg.get("taint_reapproval", True)
+                  and (name in tools.MUTATING_TOOLS
+                       or name.startswith("mcp__")))
         if self.yolo or not needs_approval:
-            return True
+            return self._confirm_tainted(name, preview) if regate else True
         for rule in self.session_allow:
             if config_mod.rule_matches(rule, name, args):
-                return True
+                return self._confirm_tainted(name, preview) if regate else True
         for rule in self.cfg.get("permissions", {}).get("allow", []):
             if config_mod.rule_matches(rule, name, args):
-                return True
+                return self._confirm_tainted(name, preview) if regate else True
         if preview is not None:
             preview()
         rule = self.rule_for(name, args)
@@ -68,6 +83,32 @@ class ApprovalPolicy:
             config_mod.add_allow_rule(rule)
             self.console.print(f"[dim]saved allow rule: {escape(rule)} "
                                f"({config_mod.CONFIG_PATH})[/dim]")
+            return True
+        return answer in ("y", "yes")
+
+    def _confirm_tainted(self, name: str, preview=None) -> bool:
+        """Re-approval for a mutating tool after untrusted ingestion.
+
+        Fires only where the normal gate would have auto-approved (--yolo or
+        an allow rule): an interactive prompt is already an explicit human
+        check, so it is not doubled. Silence / no TTY fails closed — a
+        headless --yolo run cannot mutate anything after reading untrusted
+        content unless taint_reapproval is turned off in the config."""
+        if preview is not None:
+            preview()
+        try:
+            answer = self.console.input(
+                f"[yellow]⚠ untrusted tool output has entered this session — "
+                f"re-approve {escape(name)}? \\[y/n/a=trust session content, "
+                f"stop asking][/yellow] "
+            ).strip().lower()
+        except (EOFError, OSError):
+            return False  # fail closed
+        if answer == "a":
+            self.taint_trusted = True
+            self.console.print(
+                "[dim]taint re-approval off for the rest of this session "
+                "(config: taint_reapproval)[/dim]")
             return True
         return answer in ("y", "yes")
 

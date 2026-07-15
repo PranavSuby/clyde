@@ -6,6 +6,15 @@ Config:
     }
 
 Each server's tools appear to the model as mcp__<server>__<tool>.
+
+An optional "allow" list per server restricts which of its tools are exposed
+to the model at all (and callable — enforced again at call time):
+
+    "weather": {"command": [...], "allow": ["get_forecast"]}
+
+Without it every tool the server advertises is exposed; a server that adds
+tools later (rug pull) silently grows the attack surface, so pinning the
+tools you actually use is recommended for third-party servers.
 """
 
 import json
@@ -21,9 +30,12 @@ class MCPError(Exception):
 
 
 class MCPServer:
-    def __init__(self, name: str, command: list[str], timeout: float = 30.0):
+    def __init__(self, name: str, command: list[str], timeout: float = 30.0,
+                 allow: list[str] | None = None):
         self.name = name
         self.timeout = timeout
+        # None = expose everything; a set = only these tool names exist for us
+        self.allowed = set(allow) if allow is not None else None
         self._id = 0
         self._responses: "queue.Queue[dict]" = queue.Queue()
         try:
@@ -139,7 +151,8 @@ def load_servers(cfg: dict, console=None) -> dict[str, MCPServer]:
     for name, spec in (cfg.get("mcp_servers") or {}).items():
         try:
             servers[name] = MCPServer(name, spec["command"],
-                                      timeout=spec.get("timeout", 30.0))
+                                      timeout=spec.get("timeout", 30.0),
+                                      allow=spec.get("allow"))
             if console:
                 console.print(f"[dim]mcp: {name} up "
                               f"({len(servers[name].tools)} tools)[/dim]")
@@ -153,7 +166,10 @@ def tool_schemas(servers: dict[str, MCPServer]) -> list[dict]:
     """MCP tools in OpenAI function format, namespaced mcp__server__tool."""
     out = []
     for sname, server in servers.items():
+        allowed = getattr(server, "allowed", None)
         for t in server.tools:
+            if allowed is not None and t["name"] not in allowed:
+                continue
             out.append({
                 "type": "function",
                 "function": {

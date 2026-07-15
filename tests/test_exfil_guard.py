@@ -32,8 +32,11 @@ def _tc(name, **args):
 
 
 def _agent(script, cfg=None):
+    # taint_reapproval off: these tests isolate the exfil guard, which must
+    # fire on its own without the read→mutate re-approval gate in front of it
+    cfg = {"taint_reapproval": False, **(cfg or {})}
     return Agent(ScriptedProvider(script), Console(file=open(os.devnull, "w")),
-                 cfg or {}, yolo=True)
+                 cfg, yolo=True)
 
 
 def setup_function():
